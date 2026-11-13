@@ -426,8 +426,14 @@ class ClientHandler(threading.Thread):
             if not isinstance(text, str) or not text.strip():
                 logger.warning(f"Empty chat message from {self.username} rejected.")
                 return
-            if len(text) > 4000:
-                payload["text"] = text[:4000]
+            max_len = getattr(config, "MAX_CHAT_LENGTH", 2000)
+            if len(text) > max_len:
+                logger.warning(f"Chat message from {self.username} exceeds {max_len} chars. Truncating.")
+                text = text[:max_len]
+                payload["text"] = text
+
+            if "time" not in payload or not payload["time"]:
+                payload["time"] = time.strftime("%H:%M:%S")
 
             with room._lock:
                 seq = room.next_seq_num()
@@ -438,7 +444,7 @@ class ClientHandler(threading.Thread):
                 message.seq_num = seq
                 message.room_code = self.room_code
                 message.room_id = self.room_code
-                room.add_chat_message(message.payload)
+                room.add_chat_message(message.payload, max_history=getattr(config, "MAX_CHAT_HISTORY", 500))
 
             room.broadcast(message)
 

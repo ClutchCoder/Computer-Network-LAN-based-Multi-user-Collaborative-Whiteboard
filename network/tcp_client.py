@@ -379,8 +379,14 @@ class WhiteboardClient:
         self._send_message(msg)
 
     def send_chat(self, text: str) -> None:
+        clean_text = (text or "").strip()
+        if not clean_text:
+            return
+        max_len = getattr(config, "MAX_CHAT_LENGTH", 2000)
+        if len(clean_text) > max_len:
+            clean_text = clean_text[:max_len]
         msg = create_chat_msg(
-            self.user_id or self.client_id, self.username, text, color=self.assigned_color
+            self.user_id or self.client_id, self.username, clean_text, color=self.assigned_color
         )
         msg.room_code = self.room_code
         self._send_message(msg)

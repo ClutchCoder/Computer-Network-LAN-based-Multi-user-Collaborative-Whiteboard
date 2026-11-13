@@ -333,3 +333,23 @@ When physical network connectivity drops (e.g., transient Wi-Fi disruption or ca
 2. **Session Preservation**: The server caches client session tokens (`_session_cache[client_id]`), preserving assigned `user_id`, color, and room membership.
 3. **Re-Handshake**: The client triggers `client.reconnect()`, issuing a `JOIN` message containing `is_reconnect=True`, `client_id`, `room_code`, and `last_seq_num`.
 4. **Authoritative State Recovery**: The server recognizes the returning client, re-registers the new TCP socket descriptor to the user, and sends a `JOIN_ACK` containing the complete canvas history, persistent chat messages, and latest sequence number, seamlessly restoring the client's canvas without data loss.
+
+---
+
+## 9. Integrated Real-Time Group Chat Protocol & Concurrency
+
+### 9.1 Unified TCP Infrastructure
+Chat communication does not require separate ports, WebSockets, or polling endpoints. Instead, chat runs natively over the exact same low-latency, length-prefixed TCP socket connection as canvas vector strokes:
+- **Framing**: `[4-byte big-endian length prefix][JSON payload]`
+- **Message Type**: `CHAT_MESSAGE`
+- **Socket Efficiency**: Disabling Nagle's algorithm (`TCP_NODELAY = True`) delivers instant keystroke-to-screen propagation across all connected LAN participants.
+
+### 9.2 Authoritative Identity & Message Validation
+- **Spoofing Defense**: The sender's identity (`user_id`, `username`, `color`) is enforced authoritatively by the server based on the authenticated TCP session. Clients cannot impersonate other peers in the chat.
+- **Message Length Validation**: The server validates that incoming text is a valid non-empty string and truncates any messages exceeding `MAX_CHAT_LENGTH = 2000` characters.
+- **Authoritative Timestamping**: The server stamps an authoritative time string (`HH:MM:SS`) on each accepted message to preserve clock uniformity regardless of local client time skews.
+
+### 9.3 Chronological Chat History & Late-Join Synchronization
+- Every `WhiteboardRoom` maintains an append-only persistent list of chat messages up to `MAX_CHAT_HISTORY = 500`.
+- Incoming chat messages are assigned monotonically increasing sequence numbers (`seq_num`) under `room._lock`, guaranteeing strict total order under concurrent multi-user load.
+- When new participants join an active session, the complete chronological chat history is packaged into the `JOIN_SUCCESS` payload, allowing immediate catch-up.

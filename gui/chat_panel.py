@@ -144,6 +144,8 @@ class ChatPanel(ttk.Frame):
         text = self.chat_entry.get().strip()
         if not text:
             return
+        if len(text) > 2000:
+            text = text[:2000]
         self.chat_entry.delete(0, tk.END)
         if self.on_send_chat:
             self.on_send_chat(text)

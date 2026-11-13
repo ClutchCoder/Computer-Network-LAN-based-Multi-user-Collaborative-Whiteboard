@@ -28,6 +28,10 @@ ENABLE_TCP_NODELAY = True
 # waiting for TIME_WAIT socket states to expire.
 ENABLE_SO_REUSEADDR = True
 
+# --- Chat Configuration ---
+MAX_CHAT_LENGTH = 2000              # Maximum character length for a single chat message
+MAX_CHAT_HISTORY = 500              # Maximum persistent chat messages stored per room
+
 # --- Canvas Defaults ---
 DEFAULT_CANVAS_WIDTH = 1280
 DEFAULT_CANVAS_HEIGHT = 800
