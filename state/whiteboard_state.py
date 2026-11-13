@@ -60,12 +60,20 @@ class WhiteboardState:
                     return a
         return None
 
-    def undo_action(self, user_id: Optional[str] = None, target_action_id: Optional[str] = None) -> Optional[WhiteboardAction]:
+    def undo_action(
+        self,
+        user_id: Optional[str] = None,
+        target_action_id: Optional[str] = None,
+        scope: Optional[str] = None,
+    ) -> Optional[WhiteboardAction]:
         """
-        Collaborative Undo:
-        If target_action_id is specified, undos that specific action.
-        Else if user_id is provided, undos that user's most recent active action.
-        Else, undos the board's most recent active action.
+        Collaborative Operation-Based / User-Centric Undo:
+        If target_action_id is specified: reverses that exact action.
+        If scope == "room" or (scope is None and user_id is None):
+            Reverses the most recent eligible active operation in the room's history
+            (Server-authoritative, operation-based collaborative undo).
+        If scope == "user" or (scope is None and user_id is not None):
+            Reverses the requesting user's most recent active operation.
         """
         with self._lock:
             target = None
@@ -73,19 +81,24 @@ class WhiteboardState:
                 target = self.get_action_by_id(target_action_id)
                 if target and target.is_undone:
                     target = None
-            elif user_id:
-                # Find user's last active action
-                for a in reversed(self._actions):
-                    if a.user_id == user_id and not a.is_undone:
-                        target = a
-                        break
-
-            # Fallback to board's last active action if user has none
-            if not target:
+            elif scope == "room" or (scope is None and not user_id):
+                # Server-authoritative operation-based undo: most recent active operation on board
                 for a in reversed(self._actions):
                     if not a.is_undone:
                         target = a
                         break
+            elif user_id:
+                # User-centric undo: find user's most recent active action
+                for a in reversed(self._actions):
+                    if a.user_id == user_id and not a.is_undone:
+                        target = a
+                        break
+                # Fallback to room's last active action if user has none
+                if not target:
+                    for a in reversed(self._actions):
+                        if not a.is_undone:
+                            target = a
+                            break
 
             if target:
                 target.is_undone = True
@@ -93,9 +106,14 @@ class WhiteboardState:
                 return target
             return None
 
-    def redo_action(self, user_id: Optional[str] = None, target_action_id: Optional[str] = None) -> Optional[WhiteboardAction]:
+    def redo_action(
+        self,
+        user_id: Optional[str] = None,
+        target_action_id: Optional[str] = None,
+        scope: Optional[str] = None,
+    ) -> Optional[WhiteboardAction]:
         """
-        Collaborative Redo:
+        Collaborative Operation-Based / User-Centric Redo:
         Restores the most recently undone action.
         """
         with self._lock:
@@ -104,6 +122,11 @@ class WhiteboardState:
                 target = self.get_action_by_id(target_action_id)
                 if target and not target.is_undone:
                     target = None
+            elif scope == "room" or (scope is None and not user_id):
+                # Operation-based redo from general stack
+                if self._redo_stack:
+                    act_id = self._redo_stack.pop()
+                    target = self.get_action_by_id(act_id)
             elif user_id and self._redo_stack:
                 # Check redo stack for user's action
                 for act_id in reversed(self._redo_stack):
@@ -112,11 +135,10 @@ class WhiteboardState:
                         target = candidate
                         self._redo_stack.remove(act_id)
                         break
-
-            # Fallback to general redo stack
-            if not target and self._redo_stack:
-                act_id = self._redo_stack.pop()
-                target = self.get_action_by_id(act_id)
+                # Fallback to general redo stack
+                if not target and self._redo_stack:
+                    act_id = self._redo_stack.pop()
+                    target = self.get_action_by_id(act_id)
 
             if target:
                 target.is_undone = False
@@ -158,15 +180,39 @@ class WhiteboardState:
                     self._redo_stack.append(a.action_id)
 
     def save_to_file(self, filepath: str) -> None:
-        """Persists the whiteboard session state to a JSON file."""
+        """
+        Persists the whiteboard session state to a JSON file using atomic file writing.
+        Computer Networks / Distributed Systems Principle:
+          Atomic File Replacement avoids file corruption during crashes or partial writes.
+          1. Writes complete serialized payload to a temporary file in the same directory.
+          2. Flushes buffers and executes fsync to guarantee physical write to disk.
+          3. Atomically replaces target file using os.replace(), ensuring readers
+             never observe a partially written or corrupted state.
+        """
+        import tempfile
         with self._lock:
             data = {
                 "format": "LAN_WHITEBOARD_STATE_V1",
                 "action_count": len(self._actions),
                 "actions": self.to_dict_list(),
             }
-            with open(filepath, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
+            dir_name = os.path.dirname(os.path.abspath(filepath)) or "."
+            os.makedirs(dir_name, exist_ok=True)
+
+            temp_fd, temp_path = tempfile.mkstemp(dir=dir_name, prefix=".wb_state_tmp_", suffix=".json")
+            try:
+                with os.fdopen(temp_fd, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(temp_path, filepath)
+            except Exception:
+                if os.path.exists(temp_path):
+                    try:
+                        os.remove(temp_path)
+                    except Exception:
+                        pass
+                raise
 
     def load_from_file(self, filepath: str) -> None:
         """Restores the whiteboard session state from a JSON file."""

@@ -387,10 +387,11 @@ class ClientHandler(threading.Thread):
 
         elif msg_type in (MessageType.UNDO_EVENT.value, "UNDO_EVENT", "UNDO"):
             target_action_id = payload.get("action_id")
+            scope = payload.get("scope", "room")  # Server-authoritative operation-based undo by default
             broadcast_msg = None
             with room._lock:
                 undone_action = room.state.undo_action(
-                    user_id=self.user_id, target_action_id=target_action_id
+                    user_id=self.user_id, target_action_id=target_action_id, scope=scope
                 )
                 if undone_action:
                     seq = room.next_seq_num()
@@ -405,10 +406,11 @@ class ClientHandler(threading.Thread):
 
         elif msg_type in (MessageType.REDO_EVENT.value, "REDO_EVENT", "REDO"):
             target_action_id = payload.get("action_id")
+            scope = payload.get("scope", "room")  # Server-authoritative operation-based redo by default
             broadcast_msg = None
             with room._lock:
                 redone_action = room.state.redo_action(
-                    user_id=self.user_id, target_action_id=target_action_id
+                    user_id=self.user_id, target_action_id=target_action_id, scope=scope
                 )
                 if redone_action:
                     seq = room.next_seq_num()

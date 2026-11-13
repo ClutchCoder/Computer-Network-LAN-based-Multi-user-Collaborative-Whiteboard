@@ -282,21 +282,32 @@ To avoid split-brain states and synchronization conflicts, the project adopts th
 - The server maintains the master copy of all actions in `WhiteboardState`.
 - Every action has a globally unique UUID (`action_id`), creator `user_id`, type, coordinates, and an `is_undone` boolean flag.
 
-### 7.2 Non-Destructive Collaborative Undo Algorithm
-In standard single-user applications, Undo is implemented by popping from an action stack. However, in a multi-user environment:
-- If User A pops the stack, they might delete a stroke drawn by User B, causing confusion.
-- Our implementation uses **User-Centric Non-Destructive Undo**:
-  1. When User A clicks Undo, an `UNDO(user_id="user_A")` message is sent to the server.
-  2. The server scans backward through the action history to find the most recent active action where `user_id == "user_A"`.
-  3. It toggles `action.is_undone = True` and pushes `action.action_id` onto User A's redo stack.
-  4. The server broadcasts `UNDO(action_id=action.action_id)` to all clients.
-  5. Each client marks that specific action as undone and triggers a full canvas re-render from active actions.
+### 7.2 Server-Authoritative Collaborative Undo/Redo Policy
+In distributed collaborative whiteboards, managing undo/redo is a classic concurrency challenge. The system implements a **Server-Authoritative, Operation-Based Undo/Redo Policy** (with optional user-scoped targeting):
+1. **Operation-Based Linear Undo**:
+   - The central server maintains the single authoritative timeline of all operations.
+   - When any participant requests an Undo, the server scans the room's history in reverse to locate the **most recent active (eligible) operation**, regardless of who drew it.
+   - The action is non-destructively tombstoned (`is_undone = True`) and pushed to the room's redo stack.
+   - The server atomically advances the room's sequence counter (`seq_num`) and broadcasts `UNDO_EVENT(action_id, seq_num)`.
+2. **Impact on Concurrent Users**:
+   - **Chronological Inverse**: If User A draws a circle and User B immediately draws a square, a subsequent undo reverses User B's square first, followed by User A's circle, maintaining absolute temporal fidelity across all screens.
+   - **Non-Destructive Tombstoning**: Other participants' concurrent strokes are never purged or corrupted; their vector points and identifiers remain intact in memory.
+   - **Symmetric Redo**: Any participant can trigger Redo to revive the most recently undone action (`is_undone = False`), which re-broadcasts with a new sequence number.
+   - **Conflict-Free Serialization**: All undo/redo events are serialized under `room._lock`, preventing race conditions when multiple users hit Undo simultaneously.
 
-### 7.3 Late-Joining Client State Synchronization
+### 7.3 Atomic File Persistence (JSON State Storage)
+To prevent corrupted or partially-written whiteboard files during sudden crashes, network interruptions, or OS faults:
+- `WhiteboardState.save_to_file()` employs **Atomic File Replacement**:
+  1. Serializes complete whiteboard history and format metadata to a temporary file (`tempfile.mkstemp()`) on the same physical volume directory.
+  2. Flushes application buffers (`f.flush()`) and invokes `os.fsync(f.fileno())` to ensure all data blocks are committed to persistent physical storage.
+  3. Executes `os.replace(temp_path, target_path)`. Under both POSIX and modern Windows systems, `os.replace` is an atomic directory entry operation. External readers never observe a truncated or half-written file.
+
+### 7.4 Late-Joining Client State Synchronization & Snapshot Transmission
 When a new user connects to an ongoing session:
-1. The client sends `JOIN`.
-2. The server packages the entire sequence of actions (`self.state.to_dict_list()`) inside the `JOIN_ACK` payload.
+1. The client sends `JOIN_ROOM`.
+2. The server packages the entire sequence of actions (`self.state.to_dict_list()`), persistent chat history, and active participant list into the authoritative `JOIN_SUCCESS` snapshot.
 3. The joining client immediately renders the full accumulated canvas history, guaranteeing 100% state convergence across all participants.
+4. Clients can also explicitly request a fresh state snapshot at any time by issuing a `STATE_REQUEST` (`request_sync()`).
 
 ---
 
