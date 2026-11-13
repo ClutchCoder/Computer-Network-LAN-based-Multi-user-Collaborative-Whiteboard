@@ -1,6 +1,7 @@
 """
 Interactive Whiteboard Canvas Component.
-Handles mouse interactions, zero-latency local drawing, shape previews, and remote action rendering.
+Handles mouse interactions, zero-latency local drawing, shape previews,
+batched incremental point streaming, and remote action rendering.
 """
 
 import math
@@ -25,7 +26,8 @@ class Tool(str, Enum):
 
 class CanvasView(tk.Frame):
     """
-    Whiteboard Drawing Canvas with smooth stroke interpolation and shape rubber-banding.
+    Whiteboard Drawing Canvas with smooth stroke interpolation, shape rubber-banding,
+    and batched incremental point transmission.
     """
 
     def __init__(
@@ -35,6 +37,7 @@ class CanvasView(tk.Frame):
         height: int = config.DEFAULT_CANVAS_HEIGHT,
         bg_color: str = config.DEFAULT_BG_COLOR,
         on_segment_drawn: Optional[Callable[[str, float, float, float, float, str, int], None]] = None,
+        on_points_drawn: Optional[Callable[[str, List[List[float]], str, int], None]] = None,
         on_action_committed: Optional[Callable[[WhiteboardAction], None]] = None,
     ):
         super().__init__(parent)
@@ -43,6 +46,7 @@ class CanvasView(tk.Frame):
         self.bg_color = bg_color
 
         self.on_segment_drawn = on_segment_drawn
+        self.on_points_drawn = on_points_drawn
         self.on_action_committed = on_action_committed
 
         # Drawing attributes
@@ -53,6 +57,7 @@ class CanvasView(tk.Frame):
         # Interaction tracking state
         self._current_stroke_id: Optional[str] = None
         self._stroke_points: List[List[float]] = []
+        self._batch_points: List[List[float]] = []
         self._last_point: Optional[tuple] = None
         self._start_point: Optional[tuple] = None
         self._last_send_time = 0.0
@@ -117,20 +122,23 @@ class CanvasView(tk.Frame):
         self._last_point = (cx, cy)
         self._current_stroke_id = uuid.uuid4().hex
         self._stroke_points = [[cx, cy]]
+        self._batch_points = [[cx, cy]]
         self._last_send_time = time.time()
 
         if self.active_tool in (Tool.PEN, Tool.ERASER):
             draw_color = self.bg_color if self.active_tool == Tool.ERASER else self.stroke_color
             r = self.stroke_width / 2.0
-            # Draw initial dot
+            # Draw initial dot locally
             self.canvas.create_oval(
                 cx - r, cy - r, cx + r, cy + r,
                 fill=draw_color,
                 outline=draw_color,
                 tags=self._current_stroke_id,
             )
-            # Emit live segment (single dot)
-            if self.on_segment_drawn:
+            # Emit live point or segment
+            if self.on_points_drawn:
+                self.on_points_drawn(self._current_stroke_id, [[cx, cy]], draw_color, self.stroke_width)
+            elif self.on_segment_drawn:
                 self.on_segment_drawn(
                     self._current_stroke_id, cx, cy, cx, cy, draw_color, self.stroke_width
                 )
@@ -145,7 +153,7 @@ class CanvasView(tk.Frame):
             lx, ly = self._last_point
             draw_color = self.bg_color if self.active_tool == Tool.ERASER else self.stroke_color
 
-            # Draw immediate line segment on local canvas (zero latency feedback)
+            # Draw immediate line segment on local canvas (zero-latency local feedback)
             self.canvas.create_line(
                 lx, ly, cx, cy,
                 fill=draw_color,
@@ -155,17 +163,26 @@ class CanvasView(tk.Frame):
                 tags=self._current_stroke_id,
             )
 
-            # Throttle network transmission to maintain fluidity without socket flooding
+            self._stroke_points.append([cx, cy])
+            self._batch_points.append([cx, cy])
+            self._last_point = (cx, cy)
+
+            # Throttle network transmission and send batched points
             now = time.time()
             if now - self._last_send_time >= config.MOUSE_THROTTLE_INTERVAL:
-                if self.on_segment_drawn and self._current_stroke_id:
-                    self.on_segment_drawn(
-                        self._current_stroke_id, lx, ly, cx, cy, draw_color, self.stroke_width
-                    )
+                if len(self._batch_points) >= 2:
+                    if self.on_points_drawn and self._current_stroke_id:
+                        self.on_points_drawn(
+                            self._current_stroke_id, list(self._batch_points), draw_color, self.stroke_width
+                        )
+                    elif self.on_segment_drawn and self._current_stroke_id:
+                        p1, p2 = self._batch_points[0], self._batch_points[-1]
+                        self.on_segment_drawn(
+                            self._current_stroke_id, p1[0], p1[1], p2[0], p2[1], draw_color, self.stroke_width
+                        )
+                    # Retain last point as beginning of next batch segment
+                    self._batch_points = [self._batch_points[-1]]
                 self._last_send_time = now
-
-            self._stroke_points.append([cx, cy])
-            self._last_point = (cx, cy)
 
         else:
             # Shape preview rubber-banding
@@ -209,6 +226,13 @@ class CanvasView(tk.Frame):
 
             action_type = ActionType.ERASER if self.active_tool == Tool.ERASER else ActionType.PEN
             color = self.bg_color if self.active_tool == Tool.ERASER else self.stroke_color
+
+            # Finalize and flush any pending batched points
+            if len(self._batch_points) >= 2:
+                if self.on_points_drawn:
+                    self.on_points_drawn(
+                        self._current_stroke_id, list(self._batch_points), color, self.stroke_width
+                    )
 
             action = WhiteboardAction(
                 action_id=self._current_stroke_id,
@@ -264,8 +288,36 @@ class CanvasView(tk.Frame):
         self._last_point = None
         self._current_stroke_id = None
         self._stroke_points = []
+        self._batch_points = []
 
     # --- Canvas Rendering Methods ---
+
+    def draw_remote_points(
+        self, stroke_id: str, points: List[List[float]], color: str, width: int
+    ) -> None:
+        """Renders live stroke point batches arriving incrementally over the network."""
+        if not points:
+            return
+        if len(points) == 1:
+            x, y = points[0]
+            r = width / 2.0
+            self.canvas.create_oval(
+                x - r, y - r, x + r, y + r,
+                fill=color,
+                outline=color,
+                tags=stroke_id,
+            )
+        else:
+            flat_pts = [coord for pt in points for coord in pt]
+            self.canvas.create_line(
+                flat_pts,
+                fill=color,
+                width=width,
+                capstyle=tk.ROUND,
+                joinstyle=tk.ROUND,
+                smooth=True,
+                tags=stroke_id,
+            )
 
     def draw_remote_segment(
         self, stroke_id: str, x1: float, y1: float, x2: float, y2: float, color: str, width: int

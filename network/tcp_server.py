@@ -181,6 +181,28 @@ class ClientHandler(threading.Thread):
             logger.warning(f"Handshake failed for {self.addr}: {e}")
             return False
 
+    def _validate_draw_payload(self, payload: Dict[str, Any]) -> Tuple[bool, str]:
+        """Validates drawing parameters and point bounds before committing to state."""
+        points = payload.get("points")
+        if not points or not isinstance(points, list):
+            return False, "Points array missing or invalid."
+        if len(points) > 10000:
+            return False, "Point count exceeds allowable limit (10,000)."
+        width = payload.get("width", 3)
+        if not isinstance(width, (int, float)) or width <= 0 or width > 100:
+            return False, f"Invalid stroke width: {width}."
+        color = payload.get("color", "#000000")
+        if not isinstance(color, str) or len(color) > 30:
+            return False, "Invalid color specification."
+        for pt in points:
+            if not isinstance(pt, (list, tuple)) or len(pt) < 2:
+                return False, "Invalid coordinate point format."
+            if not isinstance(pt[0], (int, float)) or not isinstance(pt[1], (int, float)):
+                return False, "Coordinates must be numbers."
+            if abs(pt[0]) > 50000 or abs(pt[1]) > 50000:
+                return False, "Coordinates exceed allowable canvas bounds."
+        return True, ""
+
     def _dispatch_message(self, message: ProtocolMessage) -> None:
         """Validates incoming client actions, assigns sequence numbers, updates authoritative state, and broadcasts."""
         msg_type = message.msg_type
@@ -195,6 +217,10 @@ class ClientHandler(threading.Thread):
         if msg_type in (MessageType.DRAW_EVENT.value, "DRAW_EVENT", "DRAW_SEGMENT", "DRAW_STROKE", "SHAPE"):
             is_live = payload.get("is_live", False) or (msg_type == "DRAW_SEGMENT")
             if is_live:
+                valid, err = self._validate_draw_payload(payload)
+                if not valid:
+                    logger.warning(f"Invalid live draw payload from {self.username}: {err}")
+                    return
                 # Ephemeral stroke segment: broadcast directly to all other peers in room for low latency
                 message.seq_num = room.current_seq_num
                 message.room_code = self.room_code
@@ -214,6 +240,11 @@ class ClientHandler(threading.Thread):
                         "points": payload.get("points", []),
                         "fill": payload.get("fill"),
                     }
+                valid, err = self._validate_draw_payload(action_data)
+                if not valid:
+                    logger.warning(f"Invalid draw action rejected from {self.username}: {err}")
+                    return
+
                 action = WhiteboardAction.from_dict(action_data)
                 action.user_id = self.user_id
                 action.username = self.username

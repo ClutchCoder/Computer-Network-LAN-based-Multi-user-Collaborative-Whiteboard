@@ -242,6 +242,83 @@ class TestNetworkIntegration(unittest.TestCase):
 
         client.disconnect()
 
+    def test_05_drawing_validation_and_incremental_batching(self):
+        """Verifies incremental point batching, server validation, and state convergence."""
+        c1 = WhiteboardClient(username="ValUser1")
+        success1, _, _, _ = c1.connect("127.0.0.1", self.port, room_code="ROOM_VALIDATE")
+        self.assertTrue(success1)
+
+        c2 = WhiteboardClient(username="ValUser2")
+        success2, _, _, _ = c2.connect("127.0.0.1", self.port, room_code="ROOM_VALIDATE")
+        self.assertTrue(success2)
+
+        time.sleep(0.1)
+
+        # 1. Send incremental live batch of points (vector data, never images!)
+        stroke_uuid = "stroke_batch_123"
+        batch_pts = [[10.0, 20.0], [15.0, 25.0], [20.0, 30.0]]
+        c1.send_draw_points(stroke_uuid, batch_pts, "#3498DB", 5)
+        time.sleep(0.15)
+
+        # C2 should receive live DRAW_EVENT with points array
+        received_live = []
+        while not c2.inbound_queue.empty():
+            msg = c2.inbound_queue.get()
+            if msg.msg_type in (MessageType.DRAW_EVENT.value, "DRAW_EVENT") and msg.payload.get("is_live"):
+                received_live.append(msg)
+
+        self.assertEqual(len(received_live), 1)
+        self.assertEqual(received_live[0].payload["points"], batch_pts)
+        self.assertEqual(received_live[0].payload["stroke_id"], stroke_uuid)
+
+        # 2. Commit finalized stroke
+        stroke_action = WhiteboardAction(
+            action_id=stroke_uuid,
+            action_type=ActionType.PEN,
+            user_id=c1.user_id,
+            username="ValUser1",
+            points=batch_pts,
+            color="#3498DB",
+            width=5,
+        )
+        c1.send_stroke(stroke_action)
+        time.sleep(0.15)
+
+        # 3. Test Server Validation: Attempt to send malformed coordinates
+        from protocol.messages import ProtocolMessage
+        malformed_msg = ProtocolMessage(
+            MessageType.DRAW_EVENT,
+            {
+                "action": {
+                    "action_id": "malicious_bad_action",
+                    "action_type": "pen",
+                    "points": [["not_a_number", "bad_coord"]],
+                    "width": -99,  # invalid negative width
+                    "color": "too_long_" * 20,
+                }
+            },
+            room_id="ROOM_VALIDATE",
+            sender_id=c1.user_id,
+        )
+        c1._send_message(malformed_msg)
+        time.sleep(0.15)
+
+        # Server should reject malformed action: verify server state only has 1 action!
+        room = self.server.room_manager.get_room("ROOM_VALIDATE")
+        self.assertEqual(len(room.state.get_active_actions()), 1)
+        self.assertEqual(room.state.get_active_actions()[0].action_id, stroke_uuid)
+
+        # 4. Connect late joiner to verify deterministic convergence across all clients
+        c3 = WhiteboardClient(username="ValUser3")
+        success3, _, _, actions3 = c3.connect("127.0.0.1", self.port, room_code="ROOM_VALIDATE")
+        self.assertTrue(success3)
+        self.assertEqual(len(actions3), 1)
+        self.assertEqual(actions3[0]["action_id"], stroke_uuid)
+
+        c1.disconnect()
+        c2.disconnect()
+        c3.disconnect()
+
 
 if __name__ == "__main__":
     unittest.main()

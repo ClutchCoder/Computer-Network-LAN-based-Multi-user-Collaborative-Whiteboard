@@ -150,6 +150,37 @@ class TestWhiteboardState(unittest.TestCase):
             self.assertTrue(os.path.exists(img_path))
             self.assertGreater(os.path.getsize(img_path), 500)
 
+    def test_structured_drawing_data_and_unique_stroke_ids(self):
+        """Verifies structured drawing representation and UUID uniqueness."""
+        actions = []
+        stroke_ids = set()
+        for i in range(100):
+            act = WhiteboardAction(
+                action_type=ActionType.PEN,
+                user_id=f"user_{i % 5}",
+                username=f"Student_{i % 5}",
+                points=[[i, i + 1], [i + 2, i + 3]],
+                color="#000000",
+                width=3,
+            )
+            actions.append(act)
+            stroke_ids.add(act.action_id)
+            self.state.add_action(act)
+
+        # 100 unique stroke IDs generated
+        self.assertEqual(len(stroke_ids), 100)
+        self.assertEqual(len(self.state.get_active_actions()), 100)
+
+        # Structured serialization contains all required fields
+        serialized = actions[0].to_dict()
+        self.assertIn("action_id", serialized)
+        self.assertIn("action_type", serialized)
+        self.assertIn("user_id", serialized)
+        self.assertIn("color", serialized)
+        self.assertIn("width", serialized)
+        self.assertIn("points", serialized)
+        self.assertIn("timestamp", serialized)
+
 
 if __name__ == "__main__":
     unittest.main()

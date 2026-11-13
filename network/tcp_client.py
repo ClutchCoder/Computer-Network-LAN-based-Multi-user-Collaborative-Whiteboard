@@ -312,6 +312,23 @@ class WhiteboardClient:
         msg.room_code = self.room_code
         self._send_message(msg)
 
+    def send_draw_points(
+        self, stroke_id: str, points: List[List[float]], color: str, width: int
+    ) -> None:
+        """Transmits an incremental batch of mouse movement points."""
+        from protocol.messages import create_draw_event_msg
+        msg = create_draw_event_msg(
+            sender_id=self.user_id or self.client_id,
+            room_id=self.room_code,
+            stroke_id=stroke_id,
+            points=points,
+            color=color,
+            width=width,
+            shape_type="pen",
+            is_live=True,
+        )
+        self._send_message(msg)
+
     def send_stroke(self, action: WhiteboardAction) -> None:
         msg = create_draw_stroke_msg(action.to_dict())
         msg.room_code = self.room_code

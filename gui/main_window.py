@@ -184,6 +184,7 @@ class MainWindow(tk.Tk):
             width=config.DEFAULT_CANVAS_WIDTH,
             height=config.DEFAULT_CANVAS_HEIGHT,
             on_segment_drawn=self._on_canvas_segment_drawn,
+            on_points_drawn=self._on_canvas_points_drawn,
             on_action_committed=self._on_canvas_action_committed,
         )
         self.canvas_view.pack(fill=tk.BOTH, expand=True)
@@ -264,6 +265,13 @@ class MainWindow(tk.Tk):
         """Invoked live while user is dragging mouse with Pen/Eraser."""
         if self.client.is_connected():
             self.client.send_draw_segment(stroke_id, x1, y1, x2, y2, color, width)
+
+    def _on_canvas_points_drawn(
+        self, stroke_id: str, points: list, color: str, width: int
+    ) -> None:
+        """Invoked when an incremental batch of mouse movement points is ready."""
+        if self.client.is_connected():
+            self.client.send_draw_points(stroke_id, points, color, width)
 
     def _on_canvas_action_committed(self, action: WhiteboardAction) -> None:
         """Invoked when a drawing stroke or geometric shape is completed."""
@@ -367,23 +375,23 @@ class MainWindow(tk.Tk):
             is_live = payload.get("is_live", False) or (msg_type == "DRAW_SEGMENT")
             if is_live:
                 pts = payload.get("points")
-                if pts and len(pts) >= 2:
-                    x1, y1 = pts[0][0], pts[0][1]
-                    x2, y2 = pts[-1][0], pts[-1][1]
+                if pts:
+                    self.canvas_view.draw_remote_points(
+                        stroke_id=payload.get("stroke_id", ""),
+                        points=pts,
+                        color=payload.get("color", "#000000"),
+                        width=payload.get("width", 3),
+                    )
                 else:
-                    x1 = payload.get("x1", 0.0)
-                    y1 = payload.get("y1", 0.0)
-                    x2 = payload.get("x2", 0.0)
-                    y2 = payload.get("y2", 0.0)
-                self.canvas_view.draw_remote_segment(
-                    stroke_id=payload.get("stroke_id", ""),
-                    x1=x1,
-                    y1=y1,
-                    x2=x2,
-                    y2=y2,
-                    color=payload.get("color", "#000000"),
-                    width=payload.get("width", 3),
-                )
+                    self.canvas_view.draw_remote_segment(
+                        stroke_id=payload.get("stroke_id", ""),
+                        x1=payload.get("x1", 0.0),
+                        y1=payload.get("y1", 0.0),
+                        x2=payload.get("x2", 0.0),
+                        y2=payload.get("y2", 0.0),
+                        color=payload.get("color", "#000000"),
+                        width=payload.get("width", 3),
+                    )
             else:
                 action_data = payload.get("action")
                 if not action_data:
