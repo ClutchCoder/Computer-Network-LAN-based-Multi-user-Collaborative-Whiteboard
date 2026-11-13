@@ -3,3 +3,4 @@
 # use Python's built-in standard library with zero external dependencies.
 
 pillow>=10.0.0      # Used for high-fidelity canvas rendering and PNG/JPEG image export
+pyinstaller>=6.0.0  # Used for packaging server and client standalone executables

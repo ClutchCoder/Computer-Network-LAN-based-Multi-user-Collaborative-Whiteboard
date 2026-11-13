@@ -151,6 +151,26 @@ Every message transmitted across TCP sockets follows this binary wire frame:
 
 ---
 
+## Technology Stack & Architectural Constraints
+
+This project strictly satisfies all mandatory technical specifications:
+
+| Requirement | Specified Technology | Project Implementation |
+| :--- | :--- | :--- |
+| **Language** | Python 3 | Python 3.10+ (Standard Library) |
+| **GUI Framework** | Tkinter | Pure `tkinter` and `ttk` with decoupled event loop |
+| **Networking** | Python `socket` library | Low-level BSD Sockets (`AF_INET`, `SOCK_STREAM` & `SOCK_DGRAM`) |
+| **Transport Protocol** | TCP/IP | TCP for drawing/chat coordination; UDP for broadcast discovery |
+| **Application Protocol** | JSON | Structured envelopes with types, timestamps, and UUIDs |
+| **Message Framing** | 4-byte network byte-order length prefix | `struct.pack('!I', length)` followed by UTF-8 JSON payload |
+| **Concurrency** | Python `threading` | Thread-per-Client on server; decoupled background I/O on client |
+| **Synchronization** | `threading.Lock` / thread-safe queues | `threading.RLock` on server state; `queue.Queue` on client GUI |
+| **Persistence** | JSON-based storage | Whiteboard state serialization/deserialization to `.json` files |
+| **Packaging** | PyInstaller | `WhiteboardServer.spec`, `WhiteboardClient.spec`, `build.py`, `build.bat` |
+| **Offline Independence** | Zero Internet / Cloud | Fully self-contained on LAN, zero external APIs or cloud dependencies |
+
+---
+
 ## Installation & Requirements
 
 ### System Requirements
@@ -282,6 +302,26 @@ Run the entire suite with:
 ```bash
 python -m unittest discover tests
 ```
+
+---
+
+## Packaging Standalone Executables (PyInstaller)
+
+To distribute standalone binary executables (`.exe` on Windows, ELF on Linux) without requiring users to install Python:
+
+1. Install PyInstaller:
+   ```bash
+   pip install pyinstaller
+   ```
+2. Build both Server and Client executables:
+   ```bash
+   python build.py --target all
+   ```
+   *(Or double-click `build.bat` on Windows)*
+
+The output executables are packaged into the `dist/` directory:
+- `dist/WhiteboardServer.exe`: Standalone server with console interface.
+- `dist/WhiteboardClient.exe`: Standalone client with native windowing (no console flash).
 
 ---
 
