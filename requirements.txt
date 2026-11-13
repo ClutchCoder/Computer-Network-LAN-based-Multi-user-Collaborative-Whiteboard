@@ -1,0 +1,5 @@
+# Dependencies for LAN-Based Multi-User Collaborative Whiteboard
+# Note: Core socket networking, threading, protocol framing, and Tkinter GUI 
+# use Python's built-in standard library with zero external dependencies.
+
+pillow>=10.0.0      # Used for high-fidelity canvas rendering and PNG/JPEG image export
