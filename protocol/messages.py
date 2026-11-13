@@ -27,6 +27,8 @@ class MessageType(str, Enum):
     USER_JOINED = "USER_JOINED"
     USER_LEFT = "USER_LEFT"
     USER_LIST = "USER_LIST"
+    ROOM_LIST = "ROOM_LIST"
+    RECONNECT = "RECONNECT"
 
     # Whiteboard Drawing Operations
     DRAW_SEGMENT = "DRAW_SEGMENT"       # Live freehand segment streaming
@@ -62,6 +64,8 @@ class ProtocolMessage:
         payload: Dict[str, Any],
         msg_id: Optional[str] = None,
         timestamp: Optional[float] = None,
+        seq_num: Optional[int] = None,
+        room_code: Optional[str] = None,
     ):
         if isinstance(msg_type, MessageType):
             self.msg_type = msg_type.value
@@ -71,14 +75,21 @@ class ProtocolMessage:
         self.payload = payload if payload is not None else {}
         self.msg_id = msg_id or uuid.uuid4().hex
         self.timestamp = timestamp if timestamp is not None else time.time()
+        self.seq_num = seq_num
+        self.room_code = room_code
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        d = {
             "msg_type": self.msg_type,
             "msg_id": self.msg_id,
             "timestamp": self.timestamp,
             "payload": self.payload,
         }
+        if self.seq_num is not None:
+            d["seq_num"] = self.seq_num
+        if self.room_code is not None:
+            d["room_code"] = self.room_code
+        return d
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ProtocolMessage":
@@ -89,6 +100,8 @@ class ProtocolMessage:
             payload=data.get("payload", {}),
             msg_id=data.get("msg_id"),
             timestamp=data.get("timestamp"),
+            seq_num=data.get("seq_num"),
+            room_code=data.get("room_code"),
         )
 
     def __repr__(self) -> str:
@@ -113,14 +126,27 @@ def deserialize_message(raw_bytes: bytes) -> ProtocolMessage:
 # Factory Helper Functions for Creating Typed Protocol Messages
 # =====================================================================
 
-def create_join_msg(username: str, client_id: str) -> ProtocolMessage:
+def create_join_msg(
+    username: str,
+    client_id: str,
+    room_code: str = "MAIN",
+    passcode: str = "",
+    is_reconnect: bool = False,
+    last_seq_num: int = 0,
+) -> ProtocolMessage:
+    normalized_room = (room_code or "MAIN").upper().strip()
     return ProtocolMessage(
         MessageType.JOIN,
         {
             "username": username,
             "client_id": client_id,
+            "room_code": normalized_room,
+            "passcode": passcode,
+            "is_reconnect": is_reconnect,
+            "last_seq_num": last_seq_num,
             "version": "1.0",
         },
+        room_code=normalized_room,
     )
 
 
@@ -130,17 +156,30 @@ def create_join_ack_msg(
     color: str,
     active_users: List[Dict[str, Any]],
     current_actions: List[Dict[str, Any]],
+    room_code: str = "MAIN",
+    chat_history: Optional[List[Dict[str, Any]]] = None,
+    seq_num: int = 0,
 ) -> ProtocolMessage:
+    normalized_room = (room_code or "MAIN").upper().strip()
     return ProtocolMessage(
         MessageType.JOIN_ACK,
         {
             "user_id": user_id,
             "username": username,
             "color": color,
+            "room_code": normalized_room,
             "users": active_users,
             "actions": current_actions,
+            "chat_history": chat_history or [],
+            "seq_num": seq_num,
         },
+        seq_num=seq_num,
+        room_code=normalized_room,
     )
+
+
+def create_room_list_msg(rooms: List[Dict[str, Any]]) -> ProtocolMessage:
+    return ProtocolMessage(MessageType.ROOM_LIST, {"rooms": rooms})
 
 
 def create_join_reject_msg(reason: str) -> ProtocolMessage:

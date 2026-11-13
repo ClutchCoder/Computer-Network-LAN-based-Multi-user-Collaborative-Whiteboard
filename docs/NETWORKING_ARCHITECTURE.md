@@ -223,3 +223,28 @@ When a new user connects to an ongoing session:
 1. The client sends `JOIN`.
 2. The server packages the entire sequence of actions (`self.state.to_dict_list()`) inside the `JOIN_ACK` payload.
 3. The joining client immediately renders the full accumulated canvas history, guaranteeing 100% state convergence across all participants.
+
+---
+
+## 8. Multi-Room Sessions, Monotonic Sequence Numbers & State Recovery
+
+### 8.1 Room Management & Session Isolation
+To support multiple concurrent collaborative activities without interference, the architecture organizes collaboration into isolated **Rooms** (`WhiteboardRoom` and `RoomManager` in [`state/room.py`](file:///c:/Computer%20Network%20Project/state/room.py)):
+- **Room Code**: Alphanumeric identifier (e.g. `MAIN`, `LAB-01`, `STUDY-A`).
+- **Passcode Authentication**: Optional room protection verified during the TCP handshake.
+- **Session Scoping**: All drawing broadcasts, group chats, participant rosters, and action stacks are strictly isolated within the room. A client in `LAB-01` receives zero network traffic from `STUDY-A`.
+
+### 8.2 Monotonically Increasing Sequence Numbering & Total Ordering
+In distributed systems, operations arriving from different clients over concurrent threads can exhibit race conditions. To guarantee **Strict Total Ordering (Linearizability)**:
+1. Every room maintains an atomic integer counter `_seq_num` protected by `threading.RLock()`.
+2. Whenever a client submits an operation (`DRAW_STROKE`, `SHAPE`, `ERASE`, `CLEAR`, `UNDO`, `REDO`, `CHAT`), the server validates the action and executes:
+   $$\text{seq\_num} \leftarrow \text{room.next\_seq\_num()}$$
+3. The server attaches this monotonically increasing `seq_num` to the protocol message before broadcasting it to clients.
+4. Clients track `last_seq_num = max(last_seq_num, msg.seq_num)`. This enables clients to detect missing packets, identify causality, and request gap synchronization.
+
+### 8.3 Reconnection Protocol & State Recovery
+When physical network connectivity drops (e.g., transient Wi-Fi disruption or cable unplugging):
+1. **Disconnection Detection**: Handled via socket timeout (`SOCKET_TIMEOUT = 30.0s`) and `HEARTBEAT` failures.
+2. **Session Preservation**: The server caches client session tokens (`_session_cache[client_id]`), preserving assigned `user_id`, color, and room membership.
+3. **Re-Handshake**: The client triggers `client.reconnect()`, issuing a `JOIN` message containing `is_reconnect=True`, `client_id`, `room_code`, and `last_seq_num`.
+4. **Authoritative State Recovery**: The server recognizes the returning client, re-registers the new TCP socket descriptor to the user, and sends a `JOIN_ACK` containing the complete canvas history, persistent chat messages, and latest sequence number, seamlessly restoring the client's canvas without data loss.

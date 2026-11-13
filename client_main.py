@@ -1,7 +1,7 @@
 """
 LAN-Based Multi-User Collaborative Whiteboard - Client Executable.
 
-Launches the Tkinter GUI client application for connecting to a LAN Whiteboard server.
+Launches the Tkinter GUI client application for connecting to a LAN Whiteboard server session.
 """
 
 import argparse
@@ -16,6 +16,8 @@ def main() -> None:
     parser.add_argument("--username", default="Student", help="Display name for whiteboard and chat")
     parser.add_argument("--host", default="127.0.0.1", help="Target server LAN IP (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=config.DEFAULT_SERVER_PORT, help="Target server port (default: 5050)")
+    parser.add_argument("--room", default="MAIN", help="Whiteboard room code (default: MAIN)")
+    parser.add_argument("--passcode", default="", help="Optional room access passcode")
     parser.add_argument("--auto-connect", action="store_true", help="Automatically connect to target server on launch")
     args = parser.parse_args()
 
@@ -24,6 +26,8 @@ def main() -> None:
         auto_connect=args.auto_connect,
         host=args.host,
         port=args.port,
+        room_code=args.room,
+        passcode=args.passcode,
     )
     app.mainloop()
 

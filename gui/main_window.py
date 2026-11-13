@@ -26,7 +26,15 @@ class MainWindow(tk.Tk):
     Main Tkinter application window for the LAN-Based Multi-User Collaborative Whiteboard.
     """
 
-    def __init__(self, username: str = "Student", auto_connect: bool = False, host: str = "127.0.0.1", port: int = config.DEFAULT_SERVER_PORT):
+    def __init__(
+        self,
+        username: str = "Student",
+        auto_connect: bool = False,
+        host: str = "127.0.0.1",
+        port: int = config.DEFAULT_SERVER_PORT,
+        room_code: str = "MAIN",
+        passcode: str = "",
+    ):
         super().__init__()
         self.title("LAN Collaborative Whiteboard")
         self.geometry("1400x880")
@@ -52,7 +60,7 @@ class MainWindow(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         if auto_connect:
-            self.after(200, lambda: self._do_connect(username, host, port))
+            self.after(200, lambda: self._do_connect(username, host, port, room_code, passcode))
         else:
             self.after(200, self._open_connection_dialog)
 
@@ -95,8 +103,9 @@ class MainWindow(tk.Tk):
 
         # --- Network / Help Menu ---
         net_menu = tk.Menu(menubar, tearoff=False)
-        net_menu.add_command(label="Network Details...", command=self._show_network_info)
+        net_menu.add_command(label="Reconnect / State Recovery", command=self._action_reconnect)
         net_menu.add_command(label="Request Full State Sync", command=self._request_sync)
+        net_menu.add_command(label="Network Details...", command=self._show_network_info)
         menubar.add_cascade(label="Network", menu=net_menu)
 
         help_menu = tk.Menu(menubar, tearoff=False)
@@ -215,6 +224,9 @@ class MainWindow(tk.Tk):
 
         sep3 = ttk.Separator(self.status_bar, orient=tk.VERTICAL)
         sep3.pack(side=tk.LEFT, fill=tk.Y, padx=6)
+
+        self.room_status_label = ttk.Label(self.status_bar, text="Room: MAIN | Seq: 0", font=("Segoe UI", 9))
+        self.room_status_label.pack(side=tk.LEFT, padx=6)
 
         self.action_counter_label = ttk.Label(self.status_bar, text="Actions: 0", font=("Segoe UI", 9))
         self.action_counter_label.pack(side=tk.RIGHT, padx=6)
@@ -426,7 +438,16 @@ class MainWindow(tk.Tk):
             self.local_state.load_from_dict_list(actions_raw)
             self.canvas_view.redraw_all(self.local_state.get_all_actions())
             self._update_action_counter()
-            self.chat_panel.append_system_notification("Canvas state synchronized with server")
+            chat_hist = payload.get("chat_history", [])
+            if chat_hist:
+                for chat in chat_hist:
+                    self.chat_panel.append_chat_message(
+                        username=chat.get("username", "User"),
+                        text=chat.get("text", ""),
+                        timestamp=chat.get("time", time.strftime("%H:%M:%S")),
+                        color=chat.get("color", "#2C3E50"),
+                    )
+            self.chat_panel.append_system_notification("Canvas state and chat synchronized with server")
 
         elif msg_type == MessageType.LOAD_STATE.value:
             actions_raw = payload.get("actions", [])
@@ -442,6 +463,11 @@ class MainWindow(tk.Tk):
             self.chat_panel.append_system_notification(f"Disconnected: {reason}")
             messagebox.showwarning("Connection Lost", f"Disconnected from server:\n{reason}", parent=self)
 
+        # Update sequence number and room display
+        self.room_status_label.config(
+            text=f"Room: {self.client.room_code} | Seq: {self.client.last_seq_num}"
+        )
+
     # =========================================================================
     # Connection Management
     # =========================================================================
@@ -455,23 +481,31 @@ class MainWindow(tk.Tk):
             on_connect=self._do_connect,
         )
 
-    def _do_connect(self, username: str, host: str, port: int) -> None:
+    def _do_connect(
+        self, username: str, host: str, port: int, room_code: str = "MAIN", passcode: str = ""
+    ) -> None:
         self.client.username = username
         self.conn_label.config(text="🟡 Connecting...", foreground="#E67E22")
         self.update_idletasks()
 
-        success, err, users, actions = self.client.connect(host, port)
+        success, err, users, actions = self.client.connect(
+            host=host, port=port, room_code=room_code, passcode=passcode
+        )
         if not success:
             self.conn_label.config(text="🔴 Disconnected", foreground="#C0392B")
             messagebox.showerror("Connection Error", f"Failed to connect:\n{err}", parent=self)
             return
 
         # Connected successfully
+        self.title(f"LAN Collaborative Whiteboard - Room: {self.client.room_code}")
         self.conn_label.config(
             text=f"🟢 Connected ({host}:{port})", foreground="#27AE60"
         )
         self.user_label.config(
             text=f"User: {self.client.username} ({self.client.user_id})"
+        )
+        self.room_status_label.config(
+            text=f"Room: {self.client.room_code} | Seq: {self.client.last_seq_num}"
         )
 
         # Synchronize local state with server state
@@ -479,11 +513,51 @@ class MainWindow(tk.Tk):
         self.chat_panel.set_current_user_id(self.client.user_id)
         self.chat_panel.update_participants(users)
 
+        # Replay persistent chat history from room
+        if hasattr(self.client, "initial_chat_history") and self.client.initial_chat_history:
+            for chat in self.client.initial_chat_history:
+                self.chat_panel.append_chat_message(
+                    username=chat.get("username", "User"),
+                    text=chat.get("text", ""),
+                    timestamp=chat.get("time", time.strftime("%H:%M:%S")),
+                    color=chat.get("color", "#2C3E50"),
+                )
+
         self.local_state.load_from_dict_list(actions)
         self.canvas_view.redraw_all(self.local_state.get_all_actions())
         self._update_action_counter()
 
-        self.chat_panel.append_system_notification(f"Connected to {host}:{port} as {self.client.username}")
+        self.chat_panel.append_system_notification(
+            f"Joined room '{self.client.room_code}' on {host}:{port} as {self.client.username}"
+        )
+
+    def _action_reconnect(self) -> None:
+        """Attempts immediate reconnection and state recovery to previous room."""
+        if self.client.is_connected():
+            messagebox.showinfo("Status", "Already connected to room.", parent=self)
+            return
+
+        self.conn_label.config(text="🟡 Reconnecting...", foreground="#E67E22")
+        self.update_idletasks()
+
+        success, err, users, actions = self.client.reconnect()
+        if not success:
+            self.conn_label.config(text="🔴 Disconnected", foreground="#C0392B")
+            messagebox.showerror("Reconnection Failed", f"Could not reconnect:\n{err}", parent=self)
+            return
+
+        self.conn_label.config(
+            text=f"🟢 Connected ({self.client.server_host}:{self.client.server_port})", foreground="#27AE60"
+        )
+        self.user_label.config(text=f"User: {self.client.username} ({self.client.user_id})")
+        self.room_status_label.config(text=f"Room: {self.client.room_code} | Seq: {self.client.last_seq_num}")
+
+        self.active_users = users
+        self.chat_panel.update_participants(users)
+        self.local_state.load_from_dict_list(actions)
+        self.canvas_view.redraw_all(self.local_state.get_all_actions())
+        self._update_action_counter()
+        self.chat_panel.append_system_notification("Reconnected successfully! State recovered from server.")
 
     def _do_disconnect(self) -> None:
         if self.client.is_connected():
@@ -493,8 +567,7 @@ class MainWindow(tk.Tk):
 
     def _request_sync(self) -> None:
         if self.client.is_connected():
-            sync_req = ProtocolMessage(MessageType.SYNC_REQUEST, {})
-            self.client._send_message(sync_req)
+            self.client.request_sync()
         else:
             messagebox.showinfo("Offline", "Client is not connected to a server.", parent=self)
 

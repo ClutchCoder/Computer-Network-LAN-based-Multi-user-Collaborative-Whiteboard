@@ -59,46 +59,78 @@ def console_loop(server: WhiteboardServer) -> None:
 
             elif base_cmd == "status":
                 uptime = int(time.time() - server.start_time)
-                active_users = server.get_active_users_list()
-                actions = server.state.get_active_actions()
-                print(f"[STATUS] Uptime: {uptime}s | Active Clients: {len(active_users)} | Active Actions: {len(actions)}")
+                rooms = server.room_manager.list_rooms()
+                total_clients = sum(r["participants_count"] for r in rooms)
+                total_actions = sum(r["action_count"] for r in rooms)
+                print(f"[STATUS] Uptime: {uptime}s | Active Rooms: {len(rooms)} | Total Clients: {total_clients} | Total Actions: {total_actions}")
+
+            elif base_cmd == "rooms":
+                rooms = server.room_manager.list_rooms()
+                print(f"[ROOMS] Total Active Rooms: {len(rooms)}")
+                for r in rooms:
+                    pass_str = " (Protected)" if r["has_passcode"] else ""
+                    print(f"  • Room [{r['room_code']}]{pass_str}: '{r['name']}' | Users: {r['participants_count']} | Actions: {r['action_count']}")
 
             elif base_cmd == "clients":
-                users = server.get_active_users_list()
-                if not users:
-                    print("[CLIENTS] No active clients connected.")
-                else:
-                    print(f"[CLIENTS] Total Connected: {len(users)}")
-                    for u in users:
-                        print(f"  - User: {u['username']} (ID: {u['user_id']}) @ {u['addr']} [Color: {u['color']}]")
+                rooms = server.room_manager.list_rooms()
+                total_connected = 0
+                for r in rooms:
+                    room_obj = server.room_manager.get_room(r["room_code"])
+                    users = room_obj.get_active_users_list() if room_obj else []
+                    if users:
+                        total_connected += len(users)
+                        print(f"[ROOM {r['room_code']}] Participants ({len(users)}):")
+                        for u in users:
+                            print(f"  - User: {u['username']} (ID: {u['user_id']}) @ {u['addr']} [Color: {u['color']}]")
+                if total_connected == 0:
+                    print("[CLIENTS] No active clients currently connected.")
 
             elif base_cmd == "clear":
-                clear_action = server.state.clear(user_id="server_admin", username="Server Admin")
-                from protocol.messages import create_clear_msg
-                server.broadcast(create_clear_msg("server_admin", "Server Admin"))
-                print("[WHITEBOARD] Cleared canvas for all clients.")
+                target_room = parts[1].upper() if len(parts) > 1 else "MAIN"
+                room = server.room_manager.get_room(target_room)
+                if room:
+                    clear_action = room.state.clear(user_id="server_admin", username="Server Admin")
+                    from protocol.messages import create_clear_msg
+                    msg = create_clear_msg("server_admin", "Server Admin")
+                    msg.seq_num = room.next_seq_num()
+                    msg.room_code = target_room
+                    room.broadcast(msg)
+                    print(f"[WHITEBOARD] Cleared canvas for room '{target_room}'.")
+                else:
+                    print(f"[ERROR] Room '{target_room}' not found.")
 
             elif base_cmd == "save":
-                filename = parts[1] if len(parts) > 1 else f"whiteboard_backup_{int(time.time())}.json"
-                server.state.save_to_file(filename)
-                print(f"[STORAGE] Saved whiteboard state to {filename}")
+                target_room = parts[1].upper() if len(parts) > 1 and not parts[1].endswith(".json") else "MAIN"
+                filename = parts[2] if len(parts) > 2 else (parts[1] if len(parts) > 1 and parts[1].endswith(".json") else f"whiteboard_{target_room}_{int(time.time())}.json")
+                room = server.room_manager.get_room(target_room)
+                if room:
+                    room.state.save_to_file(filename)
+                    print(f"[STORAGE] Saved whiteboard state for room '{target_room}' to {filename}")
+                else:
+                    print(f"[ERROR] Room '{target_room}' not found.")
 
             elif base_cmd == "export":
-                filename = parts[1] if len(parts) > 1 else f"whiteboard_render_{int(time.time())}.png"
-                success = server.state.export_to_image(filename)
-                if success:
-                    print(f"[IMAGE] Exported canvas image to {filename}")
+                target_room = parts[1].upper() if len(parts) > 1 and not parts[1].endswith(".png") else "MAIN"
+                filename = parts[2] if len(parts) > 2 else (parts[1] if len(parts) > 1 and parts[1].endswith(".png") else f"whiteboard_{target_room}_{int(time.time())}.png")
+                room = server.room_manager.get_room(target_room)
+                if room:
+                    success = room.state.export_to_image(filename)
+                    if success:
+                        print(f"[IMAGE] Exported canvas image for room '{target_room}' to {filename}")
+                    else:
+                        print("[IMAGE] Export failed: Pillow library not installed.")
                 else:
-                    print("[IMAGE] Export failed: Pillow library not installed.")
+                    print(f"[ERROR] Room '{target_room}' not found.")
 
             elif base_cmd == "help":
                 print("Available Console Commands:")
-                print("  status        - Show server uptime, connected clients, action count")
-                print("  clients       - List connected client IP addresses and usernames")
-                print("  clear         - Wipe the whiteboard canvas for all connected clients")
-                print("  save [file]   - Persist current whiteboard state to JSON file")
-                print("  export [file] - Render and export current canvas as PNG image")
-                print("  quit / exit   - Gracefully shutdown the server")
+                print("  status                 - Show server uptime, active rooms, client counts")
+                print("  rooms                  - List all active whiteboard rooms and session stats")
+                print("  clients                - List connected clients grouped by room")
+                print("  clear [room]           - Wipe canvas for specified room (default: MAIN)")
+                print("  save [room] [file]     - Persist room state to JSON file")
+                print("  export [room] [file]   - Render and export room canvas as PNG image")
+                print("  quit / exit            - Gracefully shutdown the server")
 
             else:
                 print(f"Unknown command: '{cmd}'. Type 'help' for available commands.")

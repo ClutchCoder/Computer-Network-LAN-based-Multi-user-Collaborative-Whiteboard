@@ -1,5 +1,5 @@
 """
-Connection Dialog & LAN Server Discovery Window.
+Connection Dialog & LAN Server Discovery Window with Room Management.
 """
 
 import threading
@@ -13,8 +13,8 @@ from network.discovery import discover_lan_servers
 
 class ConnectionDialog(tk.Toplevel):
     """
-    Modal dialog prompting user for Username, Server Host IP, and Port,
-    with built-in UDP LAN auto-discovery.
+    Modal dialog prompting user for Username, Server Host IP, Port, Room Code,
+    and optional Room Passcode, with built-in UDP LAN auto-discovery.
     """
 
     def __init__(
@@ -23,7 +23,9 @@ class ConnectionDialog(tk.Toplevel):
         default_username: str = "User",
         default_host: str = "127.0.0.1",
         default_port: int = config.DEFAULT_SERVER_PORT,
-        on_connect: Optional[Callable[[str, str, int], None]] = None,
+        default_room_code: str = "MAIN",
+        default_passcode: str = "",
+        on_connect: Optional[Callable[..., None]] = None,
     ):
         super().__init__(parent)
         self.title("Connect to LAN Whiteboard")
@@ -37,14 +39,16 @@ class ConnectionDialog(tk.Toplevel):
         self.default_username = default_username
         self.default_host = default_host
         self.default_port = default_port
+        self.default_room_code = default_room_code
+        self.default_passcode = default_passcode
 
         self._build_ui()
         self._center_window()
 
     def _center_window(self) -> None:
         self.update_idletasks()
-        width = 460
-        height = 360
+        width = 480
+        height = 430
         x = (self.winfo_screenwidth() // 2) - (width // 2)
         y = (self.winfo_screenheight() // 2) - (height // 2)
         self.geometry(f"{width}x{height}+{x}+{y}")
@@ -59,48 +63,64 @@ class ConnectionDialog(tk.Toplevel):
             text="LAN Whiteboard Connection",
             font=("Segoe UI", 12, "bold"),
         )
-        header_label.pack(anchor=tk.W, pady=(0, 10))
+        header_label.pack(anchor=tk.W, pady=(0, 4))
 
         sub_label = ttk.Label(
             main_frame,
-            text="Connect to a server on your Local Area Network or discover running hosts.",
+            text="Connect to a server session or choose an isolated collaborative room.",
             font=("Segoe UI", 8),
             foreground="#555555",
-            wraplength=420,
+            wraplength=440,
         )
-        sub_label.pack(anchor=tk.W, pady=(0, 14))
+        sub_label.pack(anchor=tk.W, pady=(0, 10))
 
         # Form Grid
         grid_frame = ttk.Frame(main_frame)
-        grid_frame.pack(fill=tk.X, pady=(0, 10))
+        grid_frame.pack(fill=tk.X, pady=(0, 8))
 
         # Username
         ttk.Label(grid_frame, text="Username:", font=("Segoe UI", 9, "bold")).grid(
-            row=0, column=0, sticky=tk.W, pady=4
+            row=0, column=0, sticky=tk.W, pady=3
         )
         self.username_var = tk.StringVar(value=self.default_username)
-        self.username_entry = ttk.Entry(grid_frame, textvariable=self.username_var, width=30)
-        self.username_entry.grid(row=0, column=1, sticky=tk.W, pady=4, padx=(8, 0))
+        self.username_entry = ttk.Entry(grid_frame, textvariable=self.username_var, width=32)
+        self.username_entry.grid(row=0, column=1, sticky=tk.W, pady=3, padx=(8, 0))
 
         # Server IP
         ttk.Label(grid_frame, text="Server IP:", font=("Segoe UI", 9, "bold")).grid(
-            row=1, column=0, sticky=tk.W, pady=4
+            row=1, column=0, sticky=tk.W, pady=3
         )
         self.host_var = tk.StringVar(value=self.default_host)
-        self.host_entry = ttk.Entry(grid_frame, textvariable=self.host_var, width=30)
-        self.host_entry.grid(row=1, column=1, sticky=tk.W, pady=4, padx=(8, 0))
+        self.host_entry = ttk.Entry(grid_frame, textvariable=self.host_var, width=32)
+        self.host_entry.grid(row=1, column=1, sticky=tk.W, pady=3, padx=(8, 0))
 
         # Port
         ttk.Label(grid_frame, text="Port:", font=("Segoe UI", 9, "bold")).grid(
-            row=2, column=0, sticky=tk.W, pady=4
+            row=2, column=0, sticky=tk.W, pady=3
         )
         self.port_var = tk.IntVar(value=self.default_port)
-        self.port_entry = ttk.Entry(grid_frame, textvariable=self.port_var, width=10)
-        self.port_entry.grid(row=2, column=1, sticky=tk.W, pady=4, padx=(8, 0))
+        self.port_entry = ttk.Entry(grid_frame, textvariable=self.port_var, width=12)
+        self.port_entry.grid(row=2, column=1, sticky=tk.W, pady=3, padx=(8, 0))
+
+        # Room Code
+        ttk.Label(grid_frame, text="Room Code:", font=("Segoe UI", 9, "bold")).grid(
+            row=3, column=0, sticky=tk.W, pady=3
+        )
+        self.room_var = tk.StringVar(value=self.default_room_code)
+        self.room_entry = ttk.Entry(grid_frame, textvariable=self.room_var, width=16)
+        self.room_entry.grid(row=3, column=1, sticky=tk.W, pady=3, padx=(8, 0))
+
+        # Room Passcode (Optional)
+        ttk.Label(grid_frame, text="Passcode (Opt):", font=("Segoe UI", 9)).grid(
+            row=4, column=0, sticky=tk.W, pady=3
+        )
+        self.passcode_var = tk.StringVar(value=self.default_passcode)
+        self.passcode_entry = ttk.Entry(grid_frame, textvariable=self.passcode_var, width=16, show="*")
+        self.passcode_entry.grid(row=4, column=1, sticky=tk.W, pady=3, padx=(8, 0))
 
         # LAN Auto-Discovery Section
         disc_frame = ttk.LabelFrame(main_frame, text="LAN Auto-Discovery (UDP Broadcast)", padding=8)
-        disc_frame.pack(fill=tk.X, pady=(0, 12))
+        disc_frame.pack(fill=tk.X, pady=(0, 10))
 
         disc_top = ttk.Frame(disc_frame)
         disc_top.pack(fill=tk.X)
@@ -179,6 +199,8 @@ class ConnectionDialog(tk.Toplevel):
         uname = self.username_var.get().strip()
         host = self.host_var.get().strip()
         port = self.port_var.get()
+        room = self.room_var.get().strip().upper() or "MAIN"
+        passcode = self.passcode_var.get()
 
         if not uname:
             messagebox.showerror("Validation Error", "Username cannot be empty.", parent=self)
@@ -187,7 +209,11 @@ class ConnectionDialog(tk.Toplevel):
             messagebox.showerror("Validation Error", "Server IP cannot be empty.", parent=self)
             return
 
-        self.result = (uname, host, port)
+        self.result = (uname, host, port, room, passcode)
         if self.on_connect:
-            self.on_connect(uname, host, port)
+            try:
+                self.on_connect(uname, host, port, room, passcode)
+            except TypeError:
+                # Backward compatibility if 3 args expected
+                self.on_connect(uname, host, port)
         self.destroy()

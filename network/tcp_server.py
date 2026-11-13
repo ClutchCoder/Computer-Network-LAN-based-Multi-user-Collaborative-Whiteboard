@@ -1,15 +1,19 @@
 """
-Multi-Threaded TCP Whiteboard & Chat Server.
+Multi-Threaded TCP Whiteboard & Chat Server with Authoritative Room Management.
 
 Computer Networks Principle:
-Implements a concurrent TCP Server using the Thread-per-Client architecture.
-Key Network Mechanics:
-  1. Passive Socket Creation: socket(), setsockopt(SO_REUSEADDR), bind(), listen().
-  2. TCP Stream Framing: Uses length-prefixed protocol to guarantee reliable message boundaries.
-  3. TCP_NODELAY: Explicitly disables Nagle's algorithm on every client socket to eliminate
-     OS-level 40ms transmission delays for real-time stroke coordinates.
-  4. Concurrent State Coordination: Authoritative server synchronizes all drawing,
-     undo/redo actions, chat messages, and participant presence.
+Implements a concurrent Authoritative TCP Server using Thread-per-Client architecture.
+Key Network & Architectural Mechanics:
+  1. Passive Listening Socket: socket(), setsockopt(SO_REUSEADDR), bind(), listen().
+  2. Authoritative State Coordination: Server remains the single source of truth for all
+     drawing actions, undo/redo states, and sequence numbers.
+  3. Room Sessions & Access Control: Manages multiple isolated rooms identified by room codes,
+     with optional passcode authentication.
+  4. Monotonic Sequence Numbers: Assigns monotonically increasing integer sequence numbers
+     to every accepted operation in a room to guarantee strict total order.
+  5. Persistent Chat History: Preserves message log per room for late joiners and reconnected peers.
+  6. Reconnection & State Recovery: Seamlessly re-associates returning clients and syncs canvas history.
+  7. TCP_NODELAY: Explicitly disables Nagle's algorithm for sub-millisecond drawing latency.
 """
 
 import logging
@@ -34,6 +38,7 @@ from protocol.messages import (
     create_join_reject_msg,
     create_load_state_msg,
     create_redo_msg,
+    create_room_list_msg,
     create_sync_state_msg,
     create_undo_msg,
     create_user_joined_msg,
@@ -42,6 +47,7 @@ from protocol.messages import (
     serialize_message,
 )
 from state.action import WhiteboardAction
+from state.room import RoomManager, WhiteboardRoom
 from state.whiteboard_state import WhiteboardState
 
 from .discovery import DiscoveryBeaconServer
@@ -62,6 +68,7 @@ class ClientHandler(threading.Thread):
         self.user_id: Optional[str] = None
         self.username: Optional[str] = None
         self.user_color: str = "#000000"
+        self.room_code: str = "MAIN"
         self._running = True
         self.last_seen = time.time()
         self._send_lock = threading.Lock()
@@ -102,7 +109,7 @@ class ClientHandler(threading.Thread):
             self._cleanup()
 
     def _handle_handshake(self) -> bool:
-        """Processes the mandatory initial JOIN message."""
+        """Processes the mandatory initial JOIN handshake, room assignment, and authentication."""
         try:
             payload_bytes = read_framed_message(self.sock)
             message = deserialize_message(payload_bytes)
@@ -112,40 +119,62 @@ class ClientHandler(threading.Thread):
                 self.send_message(reject)
                 return False
 
-            requested_username = message.payload.get("username", "Anonymous").strip()
+            payload = message.payload
+            requested_username = payload.get("username", "Anonymous").strip()
             if not requested_username:
                 requested_username = f"User_{self.addr[1]}"
 
-            client_id = message.payload.get("client_id")
+            client_id = payload.get("client_id")
+            room_code = (payload.get("room_code") or message.room_code or "MAIN").upper().strip()
+            passcode = payload.get("passcode", "")
+            is_reconnect = payload.get("is_reconnect", False)
 
-            # Register with server
-            approved, user_id, assigned_color = self.server.register_client(
-                self, requested_username, client_id
+            # Retrieve or create room
+            room = self.server.room_manager.get_or_create_room(room_code)
+
+            # Verify room access / authentication
+            if not room.verify_passcode(passcode):
+                reject = create_join_reject_msg(f"Invalid passcode for room '{room_code}'. Access denied.")
+                self.send_message(reject)
+                return False
+
+            # Register client on server and room
+            approved, user_id, assigned_color = self.server.register_client_to_room(
+                self, room, requested_username, client_id, is_reconnect=is_reconnect
             )
             if not approved:
-                reject = create_join_reject_msg("Username already taken or server is full.")
+                reject = create_join_reject_msg("Username already active or room is full.")
                 self.send_message(reject)
                 return False
 
             self.user_id = user_id
             self.username = requested_username
             self.user_color = assigned_color
+            self.room_code = room.room_code
 
-            # Send JOIN_ACK with current state and active participants
+            # Send authoritative JOIN_ACK containing room state, history, and current sequence number
             ack_msg = create_join_ack_msg(
                 user_id=self.user_id,
                 username=self.username,
                 color=self.user_color,
-                active_users=self.server.get_active_users_list(),
-                current_actions=self.server.state.to_dict_list(),
+                active_users=room.get_active_users_list(),
+                current_actions=room.state.to_dict_list(),
+                room_code=self.room_code,
+                chat_history=room.get_chat_history(),
+                seq_num=room.current_seq_num,
             )
             self.send_message(ack_msg)
 
-            # Broadcast new arrival to everyone else
+            # Broadcast new arrival to everyone else in this room
             join_broadcast = create_user_joined_msg(self.user_id, self.username, self.user_color)
-            self.server.broadcast(join_broadcast, exclude_user_id=self.user_id)
+            join_broadcast.room_code = self.room_code
+            join_broadcast.seq_num = room.current_seq_num
+            room.broadcast(join_broadcast, exclude_user_id=self.user_id)
 
-            logger.info(f"Client '{self.username}' ({self.user_id}) joined successfully.")
+            logger.info(
+                f"Client '{self.username}' ({self.user_id}) joined room '{self.room_code}' "
+                f"[{'reconnect' if is_reconnect else 'new session'}]."
+            )
             return True
 
         except Exception as e:
@@ -153,72 +182,112 @@ class ClientHandler(threading.Thread):
             return False
 
     def _dispatch_message(self, message: ProtocolMessage) -> None:
-        """Routes incoming messages based on MessageType."""
+        """Validates incoming client actions, assigns sequence numbers, updates authoritative state, and broadcasts."""
         msg_type = message.msg_type
         payload = message.payload
 
+        room = self.server.room_manager.get_room(self.room_code)
+        if not room:
+            logger.warning(f"Message dropped: Room '{self.room_code}' not found.")
+            return
+
         if msg_type == MessageType.DRAW_SEGMENT.value:
-            # Ephemeral stroke segment: broadcast directly to all other peers for low latency
-            self.server.broadcast(message, exclude_user_id=self.user_id)
+            # Ephemeral stroke segment: broadcast directly to all other peers in room for low latency
+            message.seq_num = room.current_seq_num
+            message.room_code = self.room_code
+            room.broadcast(message, exclude_user_id=self.user_id)
 
         elif msg_type in (MessageType.DRAW_STROKE.value, MessageType.SHAPE.value, MessageType.ERASE.value):
             action_data = payload.get("action")
             if action_data:
                 action = WhiteboardAction.from_dict(action_data)
-                # Enforce authoritative user_id
+                # Enforce authoritative user_id and username
                 action.user_id = self.user_id
                 action.username = self.username
-                self.server.state.add_action(action)
-                # Broadcast committed action
-                self.server.broadcast(message, exclude_user_id=self.user_id)
+
+                # Assign monotonic sequence number
+                seq = room.next_seq_num()
+                room.state.add_action(action)
+
+                message.seq_num = seq
+                message.room_code = self.room_code
+                room.broadcast(message, exclude_user_id=self.user_id)
 
         elif msg_type == MessageType.CLEAR.value:
-            clear_action = self.server.state.clear(self.user_id, self.username)
+            seq = room.next_seq_num()
+            clear_action = room.state.clear(self.user_id, self.username)
             broadcast_msg = create_clear_msg(self.user_id, self.username)
-            self.server.broadcast(broadcast_msg)
+            broadcast_msg.seq_num = seq
+            broadcast_msg.room_code = self.room_code
+            room.broadcast(broadcast_msg)
 
         elif msg_type == MessageType.UNDO.value:
             target_action_id = payload.get("action_id")
-            undone_action = self.server.state.undo_action(
+            undone_action = room.state.undo_action(
                 user_id=self.user_id, target_action_id=target_action_id
             )
             if undone_action:
+                seq = room.next_seq_num()
                 broadcast_msg = create_undo_msg(
                     user_id=self.user_id, action_id=undone_action.action_id
                 )
-                self.server.broadcast(broadcast_msg)
+                broadcast_msg.seq_num = seq
+                broadcast_msg.room_code = self.room_code
+                room.broadcast(broadcast_msg)
 
         elif msg_type == MessageType.REDO.value:
             target_action_id = payload.get("action_id")
-            redone_action = self.server.state.redo_action(
+            redone_action = room.state.redo_action(
                 user_id=self.user_id, target_action_id=target_action_id
             )
             if redone_action:
+                seq = room.next_seq_num()
                 broadcast_msg = create_redo_msg(
                     user_id=self.user_id, action_id=redone_action.action_id
                 )
-                self.server.broadcast(broadcast_msg)
+                broadcast_msg.seq_num = seq
+                broadcast_msg.room_code = self.room_code
+                room.broadcast(broadcast_msg)
 
         elif msg_type == MessageType.CHAT.value:
-            # Stamp author info and broadcast
+            seq = room.next_seq_num()
+            # Stamp authoritative author info
             message.payload["user_id"] = self.user_id
             message.payload["username"] = self.username
             message.payload["color"] = self.user_color
-            self.server.broadcast(message)
+            message.seq_num = seq
+            message.room_code = self.room_code
+
+            # Save in room's persistent chat log
+            room.add_chat_message(message.payload)
+            room.broadcast(message)
 
         elif msg_type == MessageType.HEARTBEAT.value:
             pong = create_heartbeat_msg(self.server.server_id, is_reply=True)
+            pong.seq_num = room.current_seq_num
+            pong.room_code = self.room_code
             self.send_message(pong)
 
         elif msg_type == MessageType.SYNC_REQUEST.value:
-            sync_msg = create_sync_state_msg(self.server.state.to_dict_list())
+            # Deliver complete state recovery for late joiner or reconnected client
+            sync_msg = create_sync_state_msg(room.state.to_dict_list())
+            sync_msg.payload["chat_history"] = room.get_chat_history()
+            sync_msg.seq_num = room.current_seq_num
+            sync_msg.room_code = self.room_code
             self.send_message(sync_msg)
 
         elif msg_type == MessageType.LOAD_STATE.value:
+            seq = room.next_seq_num()
             actions_list = payload.get("actions", [])
-            self.server.state.load_from_dict_list(actions_list)
+            room.state.load_from_dict_list(actions_list)
             load_broadcast = create_load_state_msg(actions_list, loaded_by=self.username)
-            self.server.broadcast(load_broadcast)
+            load_broadcast.seq_num = seq
+            load_broadcast.room_code = self.room_code
+            room.broadcast(load_broadcast)
+
+        elif msg_type == MessageType.ROOM_LIST.value:
+            rooms_info = self.server.room_manager.list_rooms()
+            self.send_message(create_room_list_msg(rooms_info))
 
         elif msg_type == MessageType.LEAVE.value:
             self._running = False
@@ -251,12 +320,12 @@ class ClientHandler(threading.Thread):
     def _cleanup(self) -> None:
         self.close()
         if self.user_id:
-            self.server.unregister_client(self.user_id, self.username)
+            self.server.unregister_client_from_room(self.user_id, self.username, self.room_code)
 
 
 class WhiteboardServer:
     """
-    Central Authoritative Whiteboard and Chat TCP Server.
+    Central Authoritative Whiteboard, Room, and Chat TCP Server.
     """
 
     def __init__(
@@ -270,9 +339,11 @@ class WhiteboardServer:
         self.enable_discovery = enable_discovery
         self.server_id = "server_master"
 
-        self.state = WhiteboardState()
-        self._clients: Dict[str, ClientHandler] = {}
-        self._clients_lock = threading.RLock()
+        # Room and Session Manager
+        self.room_manager = RoomManager()
+        # Session cache for reconnecting clients: client_id -> {user_id, color, username, room_code}
+        self._session_cache: Dict[str, Dict[str, Any]] = {}
+        self._cache_lock = threading.RLock()
 
         self._color_index = 0
         self._server_sock: Optional[socket.socket] = None
@@ -284,8 +355,13 @@ class WhiteboardServer:
         self.start_time = 0.0
         self.total_connections_served = 0
 
+    @property
+    def state(self) -> WhiteboardState:
+        """Provides backward-compatible access to the default (MAIN) room's authoritative state."""
+        return self.room_manager.get_or_create_room("MAIN").state
+
     def start(self) -> None:
-        """Binds TCP socket, starts accept loop and discovery beacon."""
+        """Binds TCP listening socket, starts accept loop and discovery beacon."""
         self._server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
         if config.ENABLE_SO_REUSEADDR:
@@ -333,67 +409,83 @@ class WhiteboardServer:
                     logger.error(f"Socket accept error: {e}")
                 break
 
-    def register_client(
-        self, handler: ClientHandler, username: str, client_id: Optional[str]
+    def register_client_to_room(
+        self,
+        handler: ClientHandler,
+        room: WhiteboardRoom,
+        username: str,
+        client_id: Optional[str],
+        is_reconnect: bool = False,
     ) -> Tuple[bool, str, str]:
-        """Registers an authenticated client and assigns a distinct color."""
-        with self._clients_lock:
-            assigned_id = client_id or f"user_{len(self._clients) + 1}_{int(time.time() * 1000) % 10000}"
+        """Registers a client into a specific room, preserving state on reconnection."""
+        with self._cache_lock:
+            # Check if this client is reconnecting to an existing session
+            if is_reconnect and client_id and client_id in self._session_cache:
+                saved = self._session_cache[client_id]
+                assigned_id = saved["user_id"]
+                assigned_color = saved["color"]
+            else:
+                assigned_id = client_id or f"user_{int(time.time() * 1000) % 10000}"
+                assigned_color = config.PRESET_COLORS[self._color_index % len(config.PRESET_COLORS)]
+                self._color_index += 1
 
-            # Pick next color in cycle
-            assigned_color = config.PRESET_COLORS[self._color_index % len(config.PRESET_COLORS)]
-            self._color_index += 1
+                if client_id:
+                    self._session_cache[client_id] = {
+                        "user_id": assigned_id,
+                        "color": assigned_color,
+                        "username": username,
+                        "room_code": room.room_code,
+                    }
 
-            self._clients[assigned_id] = handler
+            room.register_client(assigned_id, handler)
             return True, assigned_id, assigned_color
 
-    def unregister_client(self, user_id: str, username: Optional[str]) -> None:
-        """Removes a disconnected client and broadcasts departure."""
-        with self._clients_lock:
-            if user_id in self._clients:
-                del self._clients[user_id]
-                logger.info(f"User '{username or user_id}' deregistered. Active clients: {len(self._clients)}")
+    def unregister_client_from_room(self, user_id: str, username: Optional[str], room_code: str) -> None:
+        """Removes a disconnected client from the specified room and broadcasts departure."""
+        room = self.room_manager.get_room(room_code)
+        if room:
+            room.unregister_client(user_id)
+            logger.info(
+                f"User '{username or user_id}' left room '{room_code}'. "
+                f"Remaining in room: {len(room.get_active_users_list())}"
+            )
+            left_msg = create_user_left_msg(user_id, username or "User")
+            left_msg.room_code = room_code
+            left_msg.seq_num = room.current_seq_num
+            room.broadcast(left_msg)
 
-        # Broadcast departure notice to remaining participants
-        left_msg = create_user_left_msg(user_id, username or "User")
-        self.broadcast(left_msg)
+    def broadcast(
+        self,
+        message: ProtocolMessage,
+        room_code: str = "MAIN",
+        exclude_user_id: Optional[str] = None,
+    ) -> None:
+        """Transmits message to all connected clients in the designated room."""
+        room = self.room_manager.get_room(room_code)
+        if room:
+            room.broadcast(message, exclude_user_id=exclude_user_id)
 
-    def broadcast(self, message: ProtocolMessage, exclude_user_id: Optional[str] = None) -> None:
-        """Transmits message to all connected clients (except exclude_user_id if specified)."""
-        with self._clients_lock:
-            recipients = list(self._clients.items())
-
-        for uid, handler in recipients:
-            if exclude_user_id and uid == exclude_user_id:
-                continue
-            handler.send_message(message)
-
-    def get_active_users_list(self) -> List[Dict[str, Any]]:
-        """Returns metadata list of currently connected participants."""
-        with self._clients_lock:
-            return [
-                {
-                    "user_id": h.user_id,
-                    "username": h.username,
-                    "color": h.user_color,
-                    "addr": f"{h.addr[0]}:{h.addr[1]}",
-                }
-                for h in self._clients.values()
-                if h.user_id
-            ]
+    def get_active_users_list(self, room_code: str = "MAIN") -> List[Dict[str, Any]]:
+        """Returns participant list for default or specified room."""
+        room = self.room_manager.get_room(room_code)
+        return room.get_active_users_list() if room else []
 
     def stop(self) -> None:
-        """Stops the server gracefully."""
-        logger.info("Shutting down Whiteboard Server...")
+        """Stops the server gracefully, closing all client sockets across all rooms."""
+        logger.info("Initiating graceful server shutdown...")
         self._running = False
 
         if self._discovery_beacon:
             self._discovery_beacon.stop()
 
-        with self._clients_lock:
-            for handler in list(self._clients.values()):
-                handler.close()
-            self._clients.clear()
+        # Close all client connections in all rooms
+        for room_meta in self.room_manager.list_rooms():
+            room = self.room_manager.get_room(room_meta["room_code"])
+            if room:
+                with room._lock:
+                    for handler in list(room._clients.values()):
+                        handler.close()
+                    room._clients.clear()
 
         if self._server_sock:
             try:
@@ -403,4 +495,4 @@ class WhiteboardServer:
 
         if self._accept_thread:
             self._accept_thread.join(timeout=2.0)
-        logger.info("Whiteboard Server stopped successfully.")
+        logger.info("Graceful server shutdown completed.")
