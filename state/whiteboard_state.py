@@ -19,15 +19,29 @@ class WhiteboardState:
     def __init__(self):
         self._lock = threading.RLock()
         self._actions: List[WhiteboardAction] = []
+        self._action_ids: set = set()
         # Redo stack tracks action_ids that were recently undone
         self._redo_stack: List[str] = []
 
-    def add_action(self, action: WhiteboardAction) -> None:
-        """Appends a new action to the active history."""
+    def add_action(self, action: WhiteboardAction) -> bool:
+        """
+        Appends a new action to the active history.
+        Detects and rejects duplicate action IDs to prevent state corruption.
+        Returns True if added, False if duplicate.
+        """
         with self._lock:
+            if action.action_id in self._action_ids:
+                return False
             self._actions.append(action)
+            self._action_ids.add(action.action_id)
             # When a new action is performed, clear redo stack
             self._redo_stack.clear()
+            return True
+
+    def has_action(self, action_id: str) -> bool:
+        """Checks if an action with the given ID exists in the whiteboard state."""
+        with self._lock:
+            return action_id in self._action_ids
 
     def get_all_actions(self) -> List[WhiteboardAction]:
         """Returns shallow copy of all actions."""
@@ -124,6 +138,7 @@ class WhiteboardState:
             for a in self._actions:
                 a.is_undone = True
             self._actions.append(clear_action)
+            self._action_ids.add(clear_action.action_id)
             self._redo_stack.clear()
             return clear_action
 
@@ -136,7 +151,11 @@ class WhiteboardState:
         """Replaces current state with actions from a list of dictionaries."""
         with self._lock:
             self._actions = [WhiteboardAction.from_dict(d) for d in dict_list]
+            self._action_ids = {a.action_id for a in self._actions}
             self._redo_stack.clear()
+            for a in self._actions:
+                if a.is_undone:
+                    self._redo_stack.append(a.action_id)
 
     def save_to_file(self, filepath: str) -> None:
         """Persists the whiteboard session state to a JSON file."""

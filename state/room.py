@@ -73,13 +73,22 @@ class WhiteboardRoom:
             return users
 
     def broadcast(self, message: Any, exclude_user_id: Optional[str] = None) -> None:
-        """Transmits message to all connected clients in this room."""
+        """
+        Transmits message to all connected clients in this room.
+        Computer Networks Principle:
+          Safe Concurrent Broadcasting:
+          1. Atomically snapshots recipients under self._lock.
+          2. Releases self._lock BEFORE delegating to per-client send queues.
+          3. Sockets are never written to while holding state locks, eliminating
+             deadlocks and Head-of-Line blocking from slow network consumers.
+        """
         with self._lock:
-            recipients = list(self._clients.items())
+            recipients = [
+                handler for uid, handler in self._clients.items()
+                if not (exclude_user_id and uid == exclude_user_id)
+            ]
 
-        for uid, handler in recipients:
-            if exclude_user_id and uid == exclude_user_id:
-                continue
+        for handler in recipients:
             try:
                 handler.send_message(message)
             except Exception:

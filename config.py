@@ -17,6 +17,7 @@ HEADER_SIZE = 4                     # 4-byte unsigned integer for length-prefixe
 SOCKET_TIMEOUT = 30.0               # Inactivity timeout for client sockets (seconds)
 HEARTBEAT_INTERVAL = 10.0           # Interval to send keep-alive pings (seconds)
 HEARTBEAT_TIMEOUT = 25.0            # Time without pong before declaring client dead (seconds)
+MAX_CLIENT_QUEUE_SIZE = 1000        # Per-client outgoing message queue capacity
 
 # --- TCP Socket Options ---
 # TCP_NODELAY disables Nagle's algorithm. For real-time drawing, we must transmit

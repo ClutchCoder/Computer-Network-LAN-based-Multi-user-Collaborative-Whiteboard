@@ -202,15 +202,28 @@ This forces the kernel's TCP stack to immediately send small coordinate packets 
 
 ## 5. Concurrency Architecture & Thread Synchronization
 
-### 5.1 Server Concurrency: Thread-per-Client
-The central server employs a concurrent multi-threaded architecture:
-- **`Accept Thread`**: Dedicated to waiting on `server_sock.accept()`.
-- **`ClientHandler Thread`**: One thread per connected client. Does not block other clients during I/O.
-- **Synchronization (`threading.RLock`)**:
-  - `_clients_lock`: Protects the dictionary of active client sockets during connection, broadcast, and disconnection.
-  - `_state._lock`: Protects the authoritative whiteboard action history from race conditions during concurrent drawing and undo/redo operations.
+### 5.1 Server Concurrency: Dual-Worker Per-Connection Architecture
+The central server implements a high-throughput, non-blocking concurrent worker model:
+- **`Accept Thread`**: Dedicated to polling `server_sock.accept()` and configuring `TCP_NODELAY`.
+- **`ClientReader Thread` (`ClientHandler`)**: Reads incoming framed messages from the client's TCP socket, performs format validation, checks authentication, and processes room transactions.
+- **`ClientWriter Thread` (`_writer_thread`)**: Dedicated worker for each connected client that drains a per-client thread-safe FIFO queue (`_send_queue = queue.Queue(maxsize=1000)`).
+- **Socket Serialization Guarantee**: Socket writes to a given client descriptor are strictly performed by that client's dedicated writer thread. This eliminates simultaneous socket writes, interleaving framing corruption, and race conditions.
+- **Non-Blocking Broadcasting**: Broadcasting to room participants snapshots the recipient list under `room._lock`, immediately releases the lock, and enqueues messages to the per-client queues. This decouples the server and other clients from slow or stalled network consumers, completely preventing Head-of-Line blocking.
 
-### 5.2 Client Concurrency: Decoupled GUI Event Loop
+### 5.2 Locking Hierarchy & Deadlock Elimination
+To prevent race conditions and deadlocks, the architecture enforces a strict hierarchical locking discipline:
+1. **Level 1 — `RoomManager._lock` (`threading.RLock`)**: Protects room registry lookups and creation. Never held during room operations or broadcasts.
+2. **Level 2 — `WhiteboardRoom._lock` (`threading.RLock`)**: Atomically synchronizes sequence number increments (`next_seq_num()`) and authoritative canvas state mutations (`state.add_action()`).
+3. **Level 3 — `WhiteboardState._lock` (`threading.RLock`)**: Guards internal canvas action arrays, fast duplicate ID lookup sets (`_action_ids`), and undo/redo stacks.
+4. **Lock-Free Socket Sends**: Sockets are **never** written to while holding Level 1, 2, or 3 locks. Messages are passed via queues, breaking the Coffman "Hold and Wait" condition and guaranteeing immunity from deadlocks.
+
+### 5.3 Duplicate, Stale & Invalid Operation Defense
+- **Duplicate Action Prevention**: Each action carries a globally unique `action_id`. The server maintains an $O(1)$ hash set `_action_ids`. Retransmitted actions from network glitches or retries are rejected before sequence number assignment or canvas mutation.
+- **Stale Operation Handling**: Undo/Redo requests targeting non-existent or already undone/redone actions safely no-op under lock without incrementing sequence numbers or corrupting state.
+- **Input Validation**: Coordinate values ($-50,000 \le x,y \le 50,000$), stroke widths ($1 \le w \le 100$), maximum point batches ($\le 10,000$), and chat string limits are strictly enforced.
+- **Room Isolation**: Cross-room tampering is rejected at the protocol dispatcher level.
+
+### 5.4 Client Concurrency: Decoupled GUI Event Loop
 Tkinter (like most GUI toolkits: Qt, Win32, Cocoa) is **single-threaded** and **not thread-safe**. Calling Tkinter drawing methods (`canvas.create_line()`, `listbox.insert()`) directly from a background socket thread causes memory corruption, silent crashes, or visual artifacting.
 
 #### Solution: Producer-Consumer Queue Pattern

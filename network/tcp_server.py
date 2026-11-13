@@ -17,6 +17,7 @@ Key Network & Architectural Mechanics:
 """
 
 import logging
+import queue
 import socket
 import threading
 import time
@@ -60,10 +61,15 @@ logger = logging.getLogger("WhiteboardServer")
 class ClientHandler(threading.Thread):
     """
     Dedicated worker thread managing TCP communication with a single connected client.
+    Implements Section 6 Concurrent Client Management:
+      1. One independent client-handling reader thread per connection.
+      2. One companion outgoing writer thread draining a per-client queue.
+      3. Thread-safe sequential socket writes with zero simultaneous-write race conditions.
+      4. Safe non-blocking broadcast dispatching.
     """
 
     def __init__(self, server: "WhiteboardServer", sock: socket.socket, addr: tuple):
-        super().__init__(daemon=True, name=f"ClientHandler-{addr[0]}:{addr[1]}")
+        super().__init__(daemon=True, name=f"ClientReader-{addr[0]}:{addr[1]}")
         self.server = server
         self.sock = sock
         self.addr = addr
@@ -73,7 +79,47 @@ class ClientHandler(threading.Thread):
         self.room_code: str = "MAIN"
         self._running = True
         self.last_seen = time.time()
-        self._send_lock = threading.Lock()
+
+        # Section 6: Per-client outgoing message queue preventing simultaneous socket writes
+        # and preventing slow clients from blocking broadcasts.
+        self._send_queue: queue.Queue = queue.Queue(maxsize=getattr(config, "MAX_CLIENT_QUEUE_SIZE", 1000))
+        self._writer_thread = threading.Thread(
+            target=self._writer_loop,
+            daemon=True,
+            name=f"ClientWriter-{addr[0]}:{addr[1]}",
+        )
+        self._writer_thread.start()
+
+    def _writer_loop(self) -> None:
+        """
+        Independent per-client outgoing transmission worker.
+        Computer Networks Principle:
+          Drains the per-client outgoing message queue and conducts sequential socket writes.
+          Guarantees that no two threads write to the same socket simultaneously,
+          preventing race conditions, fragmented frame interleaving, and socket corruption.
+          Crucially decouples broadcasting callers from network I/O, preventing slow consumers
+          from causing Head-of-Line blocking or thread starvation across the server.
+        """
+        while self._running and self.server.is_running():
+            try:
+                item = self._send_queue.get(timeout=0.5)
+                if item is None:
+                    # Poison pill received during close()
+                    break
+
+                raw_bytes = serialize_message(item) if isinstance(item, ProtocolMessage) else item
+                send_framed_message(self.sock, raw_bytes)
+                self._send_queue.task_done()
+            except queue.Empty:
+                continue
+            except (ConnectionClosedError, ConnectionResetError, BrokenPipeError, socket.error) as e:
+                logger.debug(f"Socket write failed for client {self.username or self.addr}: {e}")
+                self._running = False
+                break
+            except Exception as e:
+                logger.error(f"Unexpected error in writer loop for {self.addr}: {e}")
+                self._running = False
+                break
 
     def run(self) -> None:
         logger.info(f"Accepted TCP connection from {self.addr}")
@@ -208,6 +254,18 @@ class ClientHandler(threading.Thread):
         msg_type = message.msg_type
         payload = message.payload
 
+        if not self.user_id:
+            logger.warning(f"Rejected unauthenticated message '{msg_type}' from {self.addr}")
+            return
+
+        # Room isolation enforcement: clients cannot affect rooms other than their joined room
+        target_room = (message.room_code or message.room_id or self.room_code).upper().strip()
+        if target_room != self.room_code:
+            logger.warning(
+                f"Cross-room attempt by {self.username}: targeted '{target_room}' but client is in '{self.room_code}'"
+            )
+            return
+
         room = self.server.room_manager.get_room(self.room_code)
         if not room:
             logger.warning(f"Message dropped: Room '{self.room_code}' not found.")
@@ -249,8 +307,13 @@ class ClientHandler(threading.Thread):
                 action.user_id = self.user_id
                 action.username = self.username
 
-                seq = room.next_seq_num()
-                room.state.add_action(action)
+                # Concurrency: Atomic sequence assignment and state commit under room lock
+                with room._lock:
+                    if room.state.has_action(action.action_id):
+                        logger.warning(f"Duplicate action '{action.action_id}' from {self.username} rejected.")
+                        return
+                    seq = room.next_seq_num()
+                    room.state.add_action(action)
 
                 message.seq_num = seq
                 message.room_code = self.room_code
@@ -269,12 +332,21 @@ class ClientHandler(threading.Thread):
                     "width": payload.get("width", 10),
                     "points": payload.get("points", []),
                 }
+            valid, err = self._validate_draw_payload(action_data)
+            if not valid:
+                logger.warning(f"Invalid erase action rejected from {self.username}: {err}")
+                return
+
             action = WhiteboardAction.from_dict(action_data)
             action.user_id = self.user_id
             action.username = self.username
 
-            seq = room.next_seq_num()
-            room.state.add_action(action)
+            with room._lock:
+                if room.state.has_action(action.action_id):
+                    logger.warning(f"Duplicate eraser action '{action.action_id}' from {self.username} rejected.")
+                    return
+                seq = room.next_seq_num()
+                room.state.add_action(action)
 
             message.seq_num = seq
             message.room_code = self.room_code
@@ -282,46 +354,67 @@ class ClientHandler(threading.Thread):
             room.broadcast(message, exclude_user_id=self.user_id)
 
         elif msg_type in (MessageType.CLEAR_CANVAS.value, "CLEAR_CANVAS", "CLEAR"):
-            seq = room.next_seq_num()
-            clear_action = room.state.clear(self.user_id, self.username)
+            with room._lock:
+                seq = room.next_seq_num()
+                clear_action = room.state.clear(self.user_id, self.username)
             broadcast_msg = create_clear_canvas_msg(self.user_id, self.room_code, self.username, seq_num=seq)
             room.broadcast(broadcast_msg)
 
         elif msg_type in (MessageType.UNDO_EVENT.value, "UNDO_EVENT", "UNDO"):
             target_action_id = payload.get("action_id")
-            undone_action = room.state.undo_action(
-                user_id=self.user_id, target_action_id=target_action_id
-            )
-            if undone_action:
-                seq = room.next_seq_num()
-                broadcast_msg = create_undo_event_msg(
-                    sender_id=self.user_id, room_id=self.room_code, action_id=undone_action.action_id, seq_num=seq
+            broadcast_msg = None
+            with room._lock:
+                undone_action = room.state.undo_action(
+                    user_id=self.user_id, target_action_id=target_action_id
                 )
+                if undone_action:
+                    seq = room.next_seq_num()
+                    broadcast_msg = create_undo_event_msg(
+                        sender_id=self.user_id, room_id=self.room_code, action_id=undone_action.action_id, seq_num=seq
+                    )
+                else:
+                    logger.debug(f"Stale or invalid undo request from {self.username} ignored.")
+
+            if broadcast_msg:
                 room.broadcast(broadcast_msg)
 
         elif msg_type in (MessageType.REDO_EVENT.value, "REDO_EVENT", "REDO"):
             target_action_id = payload.get("action_id")
-            redone_action = room.state.redo_action(
-                user_id=self.user_id, target_action_id=target_action_id
-            )
-            if redone_action:
-                seq = room.next_seq_num()
-                broadcast_msg = create_redo_event_msg(
-                    sender_id=self.user_id, room_id=self.room_code, action_id=redone_action.action_id, seq_num=seq
+            broadcast_msg = None
+            with room._lock:
+                redone_action = room.state.redo_action(
+                    user_id=self.user_id, target_action_id=target_action_id
                 )
+                if redone_action:
+                    seq = room.next_seq_num()
+                    broadcast_msg = create_redo_event_msg(
+                        sender_id=self.user_id, room_id=self.room_code, action_id=redone_action.action_id, seq_num=seq
+                    )
+                else:
+                    logger.debug(f"Stale or invalid redo request from {self.username} ignored.")
+
+            if broadcast_msg:
                 room.broadcast(broadcast_msg)
 
         elif msg_type in (MessageType.CHAT_MESSAGE.value, "CHAT_MESSAGE", "CHAT"):
-            seq = room.next_seq_num()
-            message.payload["user_id"] = self.user_id
-            message.payload["sender_id"] = self.user_id
-            message.payload["username"] = self.username
-            message.payload["color"] = self.user_color
-            message.seq_num = seq
-            message.room_code = self.room_code
-            message.room_id = self.room_code
+            text = payload.get("text", "")
+            if not isinstance(text, str) or not text.strip():
+                logger.warning(f"Empty chat message from {self.username} rejected.")
+                return
+            if len(text) > 4000:
+                payload["text"] = text[:4000]
 
-            room.add_chat_message(message.payload)
+            with room._lock:
+                seq = room.next_seq_num()
+                message.payload["user_id"] = self.user_id
+                message.payload["sender_id"] = self.user_id
+                message.payload["username"] = self.username
+                message.payload["color"] = self.user_color
+                message.seq_num = seq
+                message.room_code = self.room_code
+                message.room_id = self.room_code
+                room.add_chat_message(message.payload)
+
             room.broadcast(message)
 
         elif msg_type in (MessageType.PING.value, "PING", "HEARTBEAT"):
@@ -333,18 +426,23 @@ class ClientHandler(threading.Thread):
             pass
 
         elif msg_type in (MessageType.STATE_REQUEST.value, "STATE_REQUEST", "SYNC_REQUEST"):
+            with room._lock:
+                actions_snapshot = room.state.to_dict_list()
+                history_snapshot = room.get_chat_history()
+                seq = room.current_seq_num
             sync_msg = create_canvas_state_msg(
                 room_id=self.room_code,
-                actions=room.state.to_dict_list(),
-                chat_history=room.get_chat_history(),
-                seq_num=room.current_seq_num,
+                actions=actions_snapshot,
+                chat_history=history_snapshot,
+                seq_num=seq,
             )
             self.send_message(sync_msg)
 
         elif msg_type == MessageType.LOAD_STATE.value:
-            seq = room.next_seq_num()
             actions_list = payload.get("actions", [])
-            room.state.load_from_dict_list(actions_list)
+            with room._lock:
+                seq = room.next_seq_num()
+                room.state.load_from_dict_list(actions_list)
             load_broadcast = create_load_state_msg(actions_list, loaded_by=self.username, room_id=self.room_code)
             load_broadcast.seq_num = seq
             room.broadcast(load_broadcast)
@@ -356,22 +454,39 @@ class ClientHandler(threading.Thread):
         elif msg_type in (MessageType.DISCONNECT.value, "DISCONNECT", "LEAVE"):
             self._running = False
 
-    def send_message(self, message: ProtocolMessage) -> bool:
-        """Sends a framed message to this client."""
-        with self._send_lock:
-            if not self._running:
+    def send_message(self, message: ProtocolMessage, block: bool = False, timeout: float = 0.5) -> bool:
+        """
+        Enqueues an outgoing message onto this client's independent transmission queue.
+        Computer Networks Principle:
+          Decouples the broadcasting thread from socket writes. Thread-safe, non-blocking,
+          and prevents slow network consumers from blocking the server or other clients.
+        """
+        if not self._running:
+            return False
+        try:
+            if block:
+                self._send_queue.put(message, block=True, timeout=timeout)
+            else:
+                self._send_queue.put_nowait(message)
+            return True
+        except queue.Full:
+            msg_type = getattr(message, "msg_type", "")
+            if msg_type in (MessageType.DRAW_SEGMENT.value, "DRAW_SEGMENT"):
+                logger.debug(f"Dropping live draw segment for slow client {self.username or self.addr}")
                 return False
-            try:
-                raw_bytes = serialize_message(message)
-                send_framed_message(self.sock, raw_bytes)
-                return True
-            except Exception as e:
-                logger.debug(f"Failed to send to {self.username or self.addr}: {e}")
-                self._running = False
-                return False
+            logger.warning(f"Send queue full for client {self.username or self.addr}. Terminating stalled client.")
+            self._running = False
+            return False
 
     def close(self) -> None:
         self._running = False
+        try:
+            self._send_queue.put_nowait(None)
+        except Exception:
+            pass
+        if self._writer_thread and self._writer_thread.is_alive():
+            if threading.current_thread() != self._writer_thread:
+                self._writer_thread.join(timeout=0.2)
         try:
             self.sock.shutdown(socket.SHUT_RDWR)
         except Exception:
