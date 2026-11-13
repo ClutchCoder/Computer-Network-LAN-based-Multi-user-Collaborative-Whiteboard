@@ -320,6 +320,15 @@ class MainWindow(tk.Tk):
                 self._update_action_counter()
 
     def _action_clear(self) -> None:
+        # Section 7: Host-Controlled Canvas Clearing
+        if self.client.is_connected() and not self.client.is_host:
+            messagebox.showinfo(
+                "Host Permission Required",
+                "Canvas clearing is host-controlled.\nOnly the room host can clear the shared whiteboard.",
+                parent=self,
+            )
+            return
+
         confirm = messagebox.askyesno(
             "Clear Whiteboard",
             "Are you sure you want to clear the entire whiteboard for all participants?",
@@ -463,7 +472,10 @@ class MainWindow(tk.Tk):
                 "user_id": payload.get("user_id", msg.sender_id),
                 "username": payload.get("username"),
                 "color": payload.get("color"),
+                "is_host": payload.get("is_host", False),
             }
+            # Avoid duplicate entries on reconnection
+            self.active_users = [u for u in self.active_users if u.get("user_id") != new_user["user_id"]]
             self.active_users.append(new_user)
             self.chat_panel.update_participants(self.active_users)
             self.chat_panel.append_system_notification(f"{new_user['username']} joined the whiteboard")
@@ -472,8 +484,19 @@ class MainWindow(tk.Tk):
             left_id = payload.get("user_id", msg.sender_id)
             left_name = payload.get("username", "Participant")
             self.active_users = [u for u in self.active_users if u.get("user_id") != left_id]
+            new_host_id = payload.get("new_host_id")
+            if new_host_id:
+                for u in self.active_users:
+                    u["is_host"] = (u.get("user_id") == new_host_id)
+                new_host_name = payload.get("new_host_username", "Participant")
+                self.chat_panel.append_system_notification(f"👑 Room host migrated to {new_host_name}")
             self.chat_panel.update_participants(self.active_users)
             self.chat_panel.append_system_notification(f"{left_name} left the whiteboard")
+
+        elif msg_type in (MessageType.ERROR.value, "ERROR"):
+            err_text = payload.get("message", "An error occurred.")
+            self.chat_panel.append_system_notification(f"⚠️ Server: {err_text}")
+            messagebox.showwarning("Whiteboard Notice", err_text, parent=self)
 
         elif msg_type in (MessageType.CANVAS_STATE.value, "CANVAS_STATE", "SYNC_STATE"):
             actions_raw = payload.get("actions", [])
@@ -505,9 +528,11 @@ class MainWindow(tk.Tk):
             self.chat_panel.append_system_notification(f"Disconnected: {reason}")
             messagebox.showwarning("Connection Lost", f"Disconnected from server:\n{reason}", parent=self)
 
-        # Update sequence number and room display
+        # Update sequence number, host indicator, and room display
+        host_tag = " (Host)" if self.client.is_host else ""
         self.room_status_label.config(
-            text=f"Room: {self.client.room_code} | Seq: {self.client.last_seq_num}"
+            text=f"Room: {self.client.room_code}{host_tag} | Seq: {self.client.last_seq_num}"
+        )
         )
 
     # =========================================================================

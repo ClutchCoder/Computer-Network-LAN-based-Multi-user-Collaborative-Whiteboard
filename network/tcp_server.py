@@ -200,7 +200,7 @@ class ClientHandler(threading.Thread):
             self.user_color = assigned_color
             self.room_code = room.room_code
 
-            # Send authoritative JOIN_SUCCESS containing room state, history, and current sequence number
+            # Send authoritative JOIN_SUCCESS containing room state, history, host, and current sequence number
             ack_msg = create_join_success_msg(
                 user_id=self.user_id,
                 username=self.username,
@@ -211,10 +211,18 @@ class ClientHandler(threading.Thread):
                 chat_history=room.get_chat_history(),
                 seq_num=room.current_seq_num,
             )
-            self.send_message(ack_msg)
+            ack_msg.payload["host_id"] = room.host_id
+            ack_msg.payload["host_username"] = room.host_username
+            ack_msg.payload["is_host"] = (self.user_id == room.host_id)
+            self.send_message(ack_msg, block=True, timeout=1.0)
 
             # Broadcast new arrival to everyone else in this room
-            join_broadcast = create_participant_joined_msg(self.user_id, self.room_code, self.username, self.user_color, seq_num=room.current_seq_num)
+            join_broadcast = create_participant_joined_msg(
+                self.user_id, self.room_code, self.username, self.user_color, seq_num=room.current_seq_num
+            )
+            join_broadcast.payload["host_id"] = room.host_id
+            join_broadcast.payload["host_username"] = room.host_username
+            join_broadcast.payload["is_host"] = (self.user_id == room.host_id)
             room.broadcast(join_broadcast, exclude_user_id=self.user_id)
 
             logger.info(
@@ -354,6 +362,23 @@ class ClientHandler(threading.Thread):
             room.broadcast(message, exclude_user_id=self.user_id)
 
         elif msg_type in (MessageType.CLEAR_CANVAS.value, "CLEAR_CANVAS", "CLEAR"):
+            # Section 7: Host-Controlled Canvas Clearing
+            if room.host_id and self.user_id != room.host_id:
+                logger.warning(
+                    f"Non-host '{self.username}' attempted to clear canvas in room '{self.room_code}'. Permission denied."
+                )
+                err_msg = ProtocolMessage(
+                    msg_type=MessageType.ERROR.value,
+                    payload={
+                        "code": "PERMISSION_DENIED",
+                        "message": "Only the room host can clear the canvas.",
+                    },
+                    room_code=self.room_code,
+                    room_id=self.room_code,
+                )
+                self.send_message(err_msg)
+                return
+
             with room._lock:
                 seq = room.next_seq_num()
                 clear_action = room.state.clear(self.user_id, self.username)
@@ -623,12 +648,18 @@ class WhiteboardServer:
         """Removes a disconnected client from the specified room and broadcasts departure."""
         room = self.room_manager.get_room(room_code)
         if room:
-            room.unregister_client(user_id)
+            new_host_id = room.unregister_client(user_id)
             logger.info(
                 f"User '{username or user_id}' left room '{room_code}'. "
-                f"Remaining in room: {len(room.get_active_users_list())}"
+                f"Remaining in room: {len(room.get_active_users_list())} "
+                f"[{f'Host migrated to: {room.host_username} ({new_host_id})' if new_host_id else 'Host unchanged'}]"
             )
-            left_msg = create_participant_left_msg(user_id, room_code, username or "User", seq_num=room.current_seq_num)
+            left_msg = create_participant_left_msg(
+                user_id, room_code, username or "User", seq_num=room.current_seq_num
+            )
+            if new_host_id:
+                left_msg.payload["new_host_id"] = new_host_id
+                left_msg.payload["new_host_username"] = room.host_username
             room.broadcast(left_msg)
 
     def broadcast(

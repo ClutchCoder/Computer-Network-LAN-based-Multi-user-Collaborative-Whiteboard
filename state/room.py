@@ -4,6 +4,8 @@ Supports multiple isolated collaborative whiteboard rooms with room codes,
 passcode authentication, authoritative sequence numbers, and persistent chat logs.
 """
 
+import random
+import string
 import threading
 import time
 from typing import Any, Dict, List, Optional
@@ -16,7 +18,7 @@ class WhiteboardRoom:
     """
     An isolated collaborative session identified by a unique room code.
     Maintains its own authoritative canvas state, participant list,
-    chat history, and monotonically increasing sequence numbering.
+    chat history, host identification, and monotonically increasing sequence numbering.
     """
 
     def __init__(self, room_code: str, name: Optional[str] = None, passcode: Optional[str] = None):
@@ -24,6 +26,10 @@ class WhiteboardRoom:
         self.name = name or f"Room {self.room_code}"
         self.passcode = passcode.strip() if passcode else None
         self.created_at = time.time()
+
+        # Section 7: Host Identification
+        self.host_id: Optional[str] = None
+        self.host_username: Optional[str] = None
 
         self.state = WhiteboardState()
         self.chat_history: List[Dict[str, Any]] = []
@@ -49,12 +55,37 @@ class WhiteboardRoom:
         return self.passcode == (candidate or "").strip()
 
     def register_client(self, user_id: str, handler: Any) -> None:
+        """Registers a client. The first participant to enter becomes the room host."""
         with self._lock:
             self._clients[user_id] = handler
+            if not self.host_id or self.host_id not in self._clients:
+                self.host_id = user_id
+                self.host_username = getattr(handler, "username", "Host")
 
-    def unregister_client(self, user_id: str) -> None:
+    def unregister_client(self, user_id: str) -> Optional[str]:
+        """
+        Unregisters a client.
+        If the departing client was the host, migrates host authority to the next active peer.
+        Returns the new host_id if host migration occurred, else None.
+        """
         with self._lock:
             self._clients.pop(user_id, None)
+            if self.host_id == user_id:
+                if self._clients:
+                    new_host_id = next(iter(self._clients.keys()))
+                    self.host_id = new_host_id
+                    new_handler = self._clients[new_host_id]
+                    self.host_username = getattr(new_handler, "username", "Host")
+                    return self.host_id
+                else:
+                    self.host_id = None
+                    self.host_username = None
+            return None
+
+    def is_host(self, user_id: str) -> bool:
+        """Checks if the specified user is the authoritative host of this room."""
+        with self._lock:
+            return bool(self.host_id and self.host_id == user_id)
 
     def get_client(self, user_id: str) -> Optional[Any]:
         with self._lock:
@@ -69,6 +100,7 @@ class WhiteboardRoom:
                     "username": getattr(handler, "username", "Anonymous"),
                     "color": getattr(handler, "user_color", "#000000"),
                     "addr": f"{handler.addr[0]}:{handler.addr[1]}" if hasattr(handler, "addr") else "unknown",
+                    "is_host": (uid == self.host_id),
                 })
             return users
 
@@ -113,6 +145,8 @@ class WhiteboardRoom:
                 "has_passcode": bool(self.passcode),
                 "participants_count": len(self._clients),
                 "action_count": len(self.state.get_active_actions()),
+                "host_id": self.host_id,
+                "host_username": self.host_username,
                 "created_at": self.created_at,
             }
 
@@ -127,6 +161,33 @@ class RoomManager:
         self._rooms: Dict[str, WhiteboardRoom] = {}
         # Ensure default main room is always available
         self.get_or_create_room("MAIN", name="General Collaboration Room")
+
+    def generate_unique_room_code(self, prefix: str = "ROOM") -> str:
+        """Generates a cryptographically strong unique room code not currently active."""
+        with self._lock:
+            for _ in range(100):
+                suffix = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
+                candidate = f"{prefix}_{suffix}"
+                if candidate not in self._rooms:
+                    return candidate
+            return f"{prefix}_{int(time.time())}"
+
+    def create_room(
+        self,
+        room_code: Optional[str] = None,
+        name: Optional[str] = None,
+        passcode: Optional[str] = None,
+    ) -> WhiteboardRoom:
+        """Explicitly creates and registers a new room session with a unique code."""
+        with self._lock:
+            code = (room_code or self.generate_unique_room_code()).upper().strip()
+            if code not in self._rooms:
+                self._rooms[code] = WhiteboardRoom(
+                    room_code=code,
+                    name=name or f"Room {code}",
+                    passcode=passcode,
+                )
+            return self._rooms[code]
 
     def get_or_create_room(
         self, room_code: str, name: Optional[str] = None, passcode: Optional[str] = None

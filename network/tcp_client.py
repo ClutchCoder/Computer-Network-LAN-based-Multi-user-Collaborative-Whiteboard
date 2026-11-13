@@ -69,6 +69,8 @@ class WhiteboardClient:
         self.room_passcode: str = ""
         self.last_seq_num: int = 0
         self.initial_chat_history: List[Dict[str, Any]] = []
+        self.host_id: Optional[str] = None
+        self.is_host: bool = False
 
         self.server_host: str = ""
         self.server_port: int = config.DEFAULT_SERVER_PORT
@@ -148,6 +150,8 @@ class WhiteboardClient:
             self.user_id = payload.get("user_id")
             self.assigned_color = payload.get("color", "#000000")
             self.room_code = payload.get("room_code", self.room_code)
+            self.host_id = payload.get("host_id")
+            self.is_host = payload.get("is_host", (self.user_id == self.host_id))
             self.last_seq_num = ack_msg.seq_num or payload.get("seq_num", 0)
             self.initial_chat_history = payload.get("chat_history", [])
 
@@ -209,6 +213,17 @@ class WhiteboardClient:
                 # Track authoritative monotonically increasing sequence number
                 if msg.seq_num is not None:
                     self.last_seq_num = max(self.last_seq_num, msg.seq_num)
+
+                # Track host state and host migration
+                if msg.msg_type in (MessageType.PARTICIPANT_JOINED.value, "PARTICIPANT_JOINED", "USER_JOINED"):
+                    if msg.payload.get("host_id"):
+                        self.host_id = msg.payload.get("host_id")
+                        self.is_host = bool(self.user_id and self.user_id == self.host_id)
+                elif msg.msg_type in (MessageType.PARTICIPANT_LEFT.value, "PARTICIPANT_LEFT", "USER_LEFT"):
+                    new_host = msg.payload.get("new_host_id")
+                    if new_host:
+                        self.host_id = new_host
+                        self.is_host = bool(self.user_id and self.user_id == self.host_id)
 
                 # Filter out heartbeat replies from filling inbound queue
                 if msg.msg_type == MessageType.HEARTBEAT.value:
@@ -281,22 +296,26 @@ class WhiteboardClient:
 
     def disconnect(self) -> None:
         """Gracefully disconnects from the server."""
-        if not self._connected:
-            return
-        self._connected = False
+        if self._connected:
+            self._connected = False
+            try:
+                leave_msg = ProtocolMessage(
+                    MessageType.LEAVE,
+                    {"user_id": self.user_id, "room_code": self.room_code},
+                    room_code=self.room_code,
+                )
+                self._send_message(leave_msg)
+            except Exception:
+                pass
         try:
-            leave_msg = ProtocolMessage(
-                MessageType.LEAVE,
-                {"user_id": self.user_id, "room_code": self.room_code},
-                room_code=self.room_code,
-            )
-            self._send_message(leave_msg)
+            if self._sock:
+                self._sock.shutdown(socket.SHUT_RDWR)
         except Exception:
             pass
         try:
             if self._sock:
-                self._sock.shutdown(socket.SHUT_RDWR)
                 self._sock.close()
+                self._sock = None
         except Exception:
             pass
         logger.info("Disconnected from server.")

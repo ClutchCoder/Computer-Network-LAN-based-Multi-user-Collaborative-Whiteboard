@@ -106,9 +106,17 @@ class ConnectionDialog(tk.Toplevel):
         ttk.Label(grid_frame, text="Room Code:", font=("Segoe UI", 9, "bold")).grid(
             row=3, column=0, sticky=tk.W, pady=3
         )
+        room_subframe = ttk.Frame(grid_frame)
+        room_subframe.grid(row=3, column=1, sticky=tk.W, pady=3, padx=(8, 0))
+
         self.room_var = tk.StringVar(value=self.default_room_code)
-        self.room_entry = ttk.Entry(grid_frame, textvariable=self.room_var, width=16)
-        self.room_entry.grid(row=3, column=1, sticky=tk.W, pady=3, padx=(8, 0))
+        self.room_entry = ttk.Entry(room_subframe, textvariable=self.room_var, width=16)
+        self.room_entry.pack(side=tk.LEFT)
+
+        self.gen_room_btn = ttk.Button(
+            room_subframe, text="🎲 New Code", width=11, command=self._generate_random_room_code
+        )
+        self.gen_room_btn.pack(side=tk.LEFT, padx=(6, 0))
 
         # Room Passcode (Optional)
         ttk.Label(grid_frame, text="Passcode (Opt):", font=("Segoe UI", 9)).grid(
@@ -157,6 +165,13 @@ class ConnectionDialog(tk.Toplevel):
 
         # Focus username
         self.username_entry.focus_set()
+
+    def _generate_random_room_code(self) -> None:
+        """Generates a random unique alphanumeric room code for new session creation."""
+        import random
+        import string
+        suffix = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
+        self.room_var.set(f"ROOM_{suffix}")
 
     def _start_scan(self) -> None:
         self.scan_btn.config(state=tk.DISABLED)

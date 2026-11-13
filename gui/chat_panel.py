@@ -104,7 +104,9 @@ class ChatPanel(ttk.Frame):
             uname = u.get("username", "Anonymous")
             color = u.get("color", "#000000")
             is_me = (uid == self.my_user_id)
-            display_text = f"● {uname} {'(You)' if is_me else ''}"
+            is_host = u.get("is_host", False)
+            host_badge = " [Host 👑]" if is_host else ""
+            display_text = f"● {uname}{host_badge} {'(You)' if is_me else ''}"
 
             self.user_listbox.insert(tk.END, display_text)
             idx = self.user_listbox.size() - 1

@@ -316,7 +316,18 @@ In distributed systems, operations arriving from different clients over concurre
 3. The server attaches this monotonically increasing `seq_num` to the protocol message before broadcasting it to clients.
 4. Clients track `last_seq_num = max(last_seq_num, msg.seq_num)`. This enables clients to detect missing packets, identify causality, and request gap synchronization.
 
-### 8.3 Reconnection Protocol & State Recovery
+### 8.3 Host Identification & Authority Migration
+In collaborative sessions, specific administrative privileges are restricted to the designated room host:
+- **Host Assignment**: The initial client creating or joining an empty room is automatically assigned as `host_id` and stamped with `is_host=True`.
+- **Participant Roster Badging**: The host is visibly identified to all peers with a host badge (`[Host 👑]`) in the participant roster.
+- **Host Migration**: If the active host abruptly disconnects or leaves, the server detects departure in `unregister_client()`, automatically migrates host authority to the next active peer in the room, and broadcasts a `PARTICIPANT_LEFT` event carrying `new_host_id` and `new_host_username`.
+
+### 8.4 Host-Controlled Canvas Clearing
+To prevent accidental canvas wiping or disruptive behavior by guests in a shared LAN environment:
+- Only the authoritative room host possesses permission to execute `CLEAR_CANVAS`.
+- If a non-host peer attempts to send a `CLEAR_CANVAS` message, the server intercepts the request under `room._lock`, rejects it without modifying canvas state or incrementing sequence numbers, and returns an `ERROR` protocol message with `PERMISSION_DENIED`.
+
+### 8.5 Reconnection Protocol & State Recovery
 When physical network connectivity drops (e.g., transient Wi-Fi disruption or cable unplugging):
 1. **Disconnection Detection**: Handled via socket timeout (`SOCKET_TIMEOUT = 30.0s`) and `HEARTBEAT` failures.
 2. **Session Preservation**: The server caches client session tokens (`_session_cache[client_id]`), preserving assigned `user_id`, color, and room membership.
