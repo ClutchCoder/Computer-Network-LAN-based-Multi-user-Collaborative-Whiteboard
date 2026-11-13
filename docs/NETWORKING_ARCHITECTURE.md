@@ -111,6 +111,67 @@ To guarantee strict message boundaries over TCP, our protocol implements a **Len
   3. Synchronously read exactly $N$ payload bytes by looping `sock.recv()` until the buffer size matches $N$.
   4. Pass the validated payload to the JSON deserializer.
 
+### 3.3 Reusable Socket Communication Functions
+The communication engine exposes four standardized functions in [`protocol/framer.py`](file:///c:/Computer%20Network%20Project/protocol/framer.py):
+1. **`encode_message(message: ProtocolMessage | dict) -> bytes`**:
+   Serializes an application message to compact UTF-8 JSON and prepends the 4-byte network-byte-order length prefix `struct.pack('!I', length)`.
+2. **`decode_message(raw_bytes: bytes) -> ProtocolMessage`**:
+   Decodes UTF-8 JSON bytes into a typed `ProtocolMessage` object, raising `InvalidJSONError` if corrupt.
+3. **`send_message(sock: socket.socket, message: ProtocolMessage | dict | bytes) -> None`**:
+   Frames the message and transmits it using `sock.sendall()`, handling connection exceptions.
+4. **`receive_message(sock: socket.socket, max_payload_size: int = 16MB) -> ProtocolMessage`**:
+   Synchronously extracts 4 header bytes, verifies payload length $\le \text{max\_payload\_size}$ (raising `OversizedMessageError`), reads exactly $N$ payload bytes via a partial read loop, and returns the decoded message.
+
+### 3.4 Application-Level JSON Protocol Specification
+Every protocol message adheres strictly to the following unified JSON schema:
+```json
+{
+  "type": "DRAW_EVENT",
+  "room_id": "ROOM123",
+  "sender_id": "USER001",
+  "timestamp": 1790000000.5,
+  "seq_num": 42,
+  "payload": {
+    "stroke_id": "STROKE001",
+    "color": "#FF0000",
+    "width": 4,
+    "points": [[100, 120], [105, 125], [110, 130]]
+  }
+}
+```
+
+#### Protocol Message Types & Semantics
+| Message Type | Direction | Description | Key Payload Attributes |
+| :--- | :---: | :--- | :--- |
+| `JOIN_ROOM` | Client $\to$ Srv | Handshake requesting admission to a room session. | `username`, `client_id`, `passcode`, `is_reconnect`, `last_seq_num` |
+| `ROOM_CREATED` | Srv $\to$ Client | Announcement of a newly instantiated room session. | `room_id`, `name`, `created_by` |
+| `JOIN_SUCCESS` | Srv $\to$ Client | Approval with authoritative state & chat history sync. | `user_id`, `color`, `room_id`, `users`, `actions`, `chat_history`, `seq_num` |
+| `JOIN_FAILURE` | Srv $\to$ Client | Rejection due to invalid passcode or server limit. | `reason` |
+| `DRAW_EVENT` | Client $\leftrightarrow$ Srv | Drawing stroke or geometric shape (Line, Rect, Circle, Arrow). | `stroke_id`, `points`, `color`, `width`, `shape_type`, `fill`, `is_live` |
+| `ERASE_EVENT` | Client $\leftrightarrow$ Srv | Eraser path operation committed to history. | `stroke_id`, `points`, `width` |
+| `UNDO_EVENT` | Client $\leftrightarrow$ Srv | Request / broadcast of undone action ID. | `action_id`, `user_id` |
+| `REDO_EVENT` | Client $\leftrightarrow$ Srv | Request / broadcast of restored action ID. | `action_id`, `user_id` |
+| `CLEAR_CANVAS` | Client $\leftrightarrow$ Srv | Authoritative command wiping room canvas. | `user_id`, `username` |
+| `CANVAS_STATE` | Srv $\to$ Client | Snapshot containing full action history and chat log. | `actions`, `chat_history`, `seq_num` |
+| `STATE_REQUEST`| Client $\to$ Srv | Explicit request for canvas state synchronization. | `last_seq_num` |
+| `CHAT_MESSAGE` | Client $\leftrightarrow$ Srv | Group chat text message with user tag. | `user_id`, `username`, `text`, `color`, `time` |
+| `PARTICIPANT_JOINED` | Srv $\to$ Client | Broadcast notification of a new arrival in room. | `user_id`, `username`, `color` |
+| `PARTICIPANT_LEFT` | Srv $\to$ Client | Broadcast notification of a member leaving room. | `user_id`, `username`, `reason` |
+| `PARTICIPANT_LIST` | Srv $\to$ Client | Current active participant roster for room. | `users` |
+| `PING` | Client $\leftrightarrow$ Srv | Periodic keep-alive heartbeat probe. | `sender_id` |
+| `PONG` | Srv $\to$ Client | Keep-alive response verifying socket liveliness. | `sender_id`, `is_reply: true` |
+| `ERROR` | Srv $\to$ Client | Error diagnosis notification. | `error_code`, `error_message` |
+| `DISCONNECT` | Client $\to$ Srv | Graceful departure notice prior to socket teardown. | `reason` |
+
+### 3.5 Robust Network Error Handling Matrix
+- **Partial TCP Reads**: Handled by `read_exact()` looping over `sock.recv()` until the exact requested byte count is collected.
+- **Multiple Coalesced Messages**: Handled by `StreamFramer` maintaining an internal buffer and popping frames sequentially.
+- **Disconnected Sockets**: Detects `0` bytes on `recv()`, raising `ConnectionClosedError` to initiate graceful cleanup.
+- **Invalid JSON**: Catches `json.JSONDecodeError` and `UnicodeDecodeError`, raising `InvalidJSONError` and isolating the faulty message without crashing the server.
+- **Oversized Messages**: Verifies length prefix before reading payload. If `length > 16MB`, raises `OversizedMessageError` to prevent memory exhaustion attacks.
+- **Socket Timeouts**: Propagates `socket.timeout`, allowing keep-alive pings and dead-peer detection.
+- **Connection Errors**: Catches `ConnectionResetError`, `BrokenPipeError`, and `socket.error` safely on sends and reads.
+
 ---
 
 ## 4. Transport Layer Tuning: Nagle's Algorithm & TCP_NODELAY

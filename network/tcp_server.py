@@ -20,6 +20,7 @@ import logging
 import socket
 import threading
 import time
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 import config
@@ -32,17 +33,18 @@ from protocol.framer import (
 from protocol.messages import (
     MessageType,
     ProtocolMessage,
-    create_clear_msg,
-    create_heartbeat_msg,
-    create_join_ack_msg,
-    create_join_reject_msg,
+    create_canvas_state_msg,
+    create_clear_canvas_msg,
+    create_join_failure_msg,
+    create_join_success_msg,
     create_load_state_msg,
-    create_redo_msg,
+    create_participant_joined_msg,
+    create_participant_left_msg,
+    create_ping_msg,
+    create_pong_msg,
+    create_redo_event_msg,
     create_room_list_msg,
-    create_sync_state_msg,
-    create_undo_msg,
-    create_user_joined_msg,
-    create_user_left_msg,
+    create_undo_event_msg,
     deserialize_message,
     serialize_message,
 )
@@ -109,13 +111,13 @@ class ClientHandler(threading.Thread):
             self._cleanup()
 
     def _handle_handshake(self) -> bool:
-        """Processes the mandatory initial JOIN handshake, room assignment, and authentication."""
+        """Processes the mandatory initial JOIN_ROOM handshake, room assignment, and authentication."""
         try:
             payload_bytes = read_framed_message(self.sock)
             message = deserialize_message(payload_bytes)
 
-            if message.msg_type != MessageType.JOIN.value:
-                reject = create_join_reject_msg("First message must be JOIN handshake.")
+            if message.msg_type not in (MessageType.JOIN_ROOM.value, "JOIN_ROOM", "JOIN"):
+                reject = create_join_failure_msg("First message must be JOIN_ROOM handshake.")
                 self.send_message(reject)
                 return False
 
@@ -125,7 +127,7 @@ class ClientHandler(threading.Thread):
                 requested_username = f"User_{self.addr[1]}"
 
             client_id = payload.get("client_id")
-            room_code = (payload.get("room_code") or message.room_code or "MAIN").upper().strip()
+            room_code = (payload.get("room_code") or payload.get("room_id") or message.room_id or "MAIN").upper().strip()
             passcode = payload.get("passcode", "")
             is_reconnect = payload.get("is_reconnect", False)
 
@@ -134,7 +136,7 @@ class ClientHandler(threading.Thread):
 
             # Verify room access / authentication
             if not room.verify_passcode(passcode):
-                reject = create_join_reject_msg(f"Invalid passcode for room '{room_code}'. Access denied.")
+                reject = create_join_failure_msg(f"Invalid passcode for room '{room_code}'. Access denied.", room_id=room_code)
                 self.send_message(reject)
                 return False
 
@@ -143,7 +145,7 @@ class ClientHandler(threading.Thread):
                 self, room, requested_username, client_id, is_reconnect=is_reconnect
             )
             if not approved:
-                reject = create_join_reject_msg("Username already active or room is full.")
+                reject = create_join_failure_msg("Username already active or room is full.", room_id=room_code)
                 self.send_message(reject)
                 return False
 
@@ -152,23 +154,21 @@ class ClientHandler(threading.Thread):
             self.user_color = assigned_color
             self.room_code = room.room_code
 
-            # Send authoritative JOIN_ACK containing room state, history, and current sequence number
-            ack_msg = create_join_ack_msg(
+            # Send authoritative JOIN_SUCCESS containing room state, history, and current sequence number
+            ack_msg = create_join_success_msg(
                 user_id=self.user_id,
                 username=self.username,
                 color=self.user_color,
                 active_users=room.get_active_users_list(),
                 current_actions=room.state.to_dict_list(),
-                room_code=self.room_code,
+                room_id=self.room_code,
                 chat_history=room.get_chat_history(),
                 seq_num=room.current_seq_num,
             )
             self.send_message(ack_msg)
 
             # Broadcast new arrival to everyone else in this room
-            join_broadcast = create_user_joined_msg(self.user_id, self.username, self.user_color)
-            join_broadcast.room_code = self.room_code
-            join_broadcast.seq_num = room.current_seq_num
+            join_broadcast = create_participant_joined_msg(self.user_id, self.room_code, self.username, self.user_color, seq_num=room.current_seq_num)
             room.broadcast(join_broadcast, exclude_user_id=self.user_id)
 
             logger.info(
@@ -191,105 +191,138 @@ class ClientHandler(threading.Thread):
             logger.warning(f"Message dropped: Room '{self.room_code}' not found.")
             return
 
-        if msg_type == MessageType.DRAW_SEGMENT.value:
-            # Ephemeral stroke segment: broadcast directly to all other peers in room for low latency
-            message.seq_num = room.current_seq_num
-            message.room_code = self.room_code
-            room.broadcast(message, exclude_user_id=self.user_id)
-
-        elif msg_type in (MessageType.DRAW_STROKE.value, MessageType.SHAPE.value, MessageType.ERASE.value):
-            action_data = payload.get("action")
-            if action_data:
+        # Check for drawing events
+        if msg_type in (MessageType.DRAW_EVENT.value, "DRAW_EVENT", "DRAW_SEGMENT", "DRAW_STROKE", "SHAPE"):
+            is_live = payload.get("is_live", False) or (msg_type == "DRAW_SEGMENT")
+            if is_live:
+                # Ephemeral stroke segment: broadcast directly to all other peers in room for low latency
+                message.seq_num = room.current_seq_num
+                message.room_code = self.room_code
+                message.room_id = self.room_code
+                room.broadcast(message, exclude_user_id=self.user_id)
+            else:
+                # Finalized drawing stroke or shape: commit to authoritative state
+                action_data = payload.get("action")
+                if not action_data:
+                    action_data = {
+                        "action_id": payload.get("stroke_id", uuid.uuid4().hex),
+                        "action_type": payload.get("shape_type", "pen"),
+                        "user_id": self.user_id,
+                        "username": self.username,
+                        "color": payload.get("color", "#000000"),
+                        "width": payload.get("width", 3),
+                        "points": payload.get("points", []),
+                        "fill": payload.get("fill"),
+                    }
                 action = WhiteboardAction.from_dict(action_data)
-                # Enforce authoritative user_id and username
                 action.user_id = self.user_id
                 action.username = self.username
 
-                # Assign monotonic sequence number
                 seq = room.next_seq_num()
                 room.state.add_action(action)
 
                 message.seq_num = seq
                 message.room_code = self.room_code
+                message.room_id = self.room_code
                 room.broadcast(message, exclude_user_id=self.user_id)
 
-        elif msg_type == MessageType.CLEAR.value:
+        elif msg_type in (MessageType.ERASE_EVENT.value, "ERASE_EVENT", "ERASE"):
+            action_data = payload.get("action")
+            if not action_data:
+                action_data = {
+                    "action_id": payload.get("stroke_id", uuid.uuid4().hex),
+                    "action_type": "eraser",
+                    "user_id": self.user_id,
+                    "username": self.username,
+                    "color": "#FFFFFF",
+                    "width": payload.get("width", 10),
+                    "points": payload.get("points", []),
+                }
+            action = WhiteboardAction.from_dict(action_data)
+            action.user_id = self.user_id
+            action.username = self.username
+
+            seq = room.next_seq_num()
+            room.state.add_action(action)
+
+            message.seq_num = seq
+            message.room_code = self.room_code
+            message.room_id = self.room_code
+            room.broadcast(message, exclude_user_id=self.user_id)
+
+        elif msg_type in (MessageType.CLEAR_CANVAS.value, "CLEAR_CANVAS", "CLEAR"):
             seq = room.next_seq_num()
             clear_action = room.state.clear(self.user_id, self.username)
-            broadcast_msg = create_clear_msg(self.user_id, self.username)
-            broadcast_msg.seq_num = seq
-            broadcast_msg.room_code = self.room_code
+            broadcast_msg = create_clear_canvas_msg(self.user_id, self.room_code, self.username, seq_num=seq)
             room.broadcast(broadcast_msg)
 
-        elif msg_type == MessageType.UNDO.value:
+        elif msg_type in (MessageType.UNDO_EVENT.value, "UNDO_EVENT", "UNDO"):
             target_action_id = payload.get("action_id")
             undone_action = room.state.undo_action(
                 user_id=self.user_id, target_action_id=target_action_id
             )
             if undone_action:
                 seq = room.next_seq_num()
-                broadcast_msg = create_undo_msg(
-                    user_id=self.user_id, action_id=undone_action.action_id
+                broadcast_msg = create_undo_event_msg(
+                    sender_id=self.user_id, room_id=self.room_code, action_id=undone_action.action_id, seq_num=seq
                 )
-                broadcast_msg.seq_num = seq
-                broadcast_msg.room_code = self.room_code
                 room.broadcast(broadcast_msg)
 
-        elif msg_type == MessageType.REDO.value:
+        elif msg_type in (MessageType.REDO_EVENT.value, "REDO_EVENT", "REDO"):
             target_action_id = payload.get("action_id")
             redone_action = room.state.redo_action(
                 user_id=self.user_id, target_action_id=target_action_id
             )
             if redone_action:
                 seq = room.next_seq_num()
-                broadcast_msg = create_redo_msg(
-                    user_id=self.user_id, action_id=redone_action.action_id
+                broadcast_msg = create_redo_event_msg(
+                    sender_id=self.user_id, room_id=self.room_code, action_id=redone_action.action_id, seq_num=seq
                 )
-                broadcast_msg.seq_num = seq
-                broadcast_msg.room_code = self.room_code
                 room.broadcast(broadcast_msg)
 
-        elif msg_type == MessageType.CHAT.value:
+        elif msg_type in (MessageType.CHAT_MESSAGE.value, "CHAT_MESSAGE", "CHAT"):
             seq = room.next_seq_num()
-            # Stamp authoritative author info
             message.payload["user_id"] = self.user_id
+            message.payload["sender_id"] = self.user_id
             message.payload["username"] = self.username
             message.payload["color"] = self.user_color
             message.seq_num = seq
             message.room_code = self.room_code
+            message.room_id = self.room_code
 
-            # Save in room's persistent chat log
             room.add_chat_message(message.payload)
             room.broadcast(message)
 
-        elif msg_type == MessageType.HEARTBEAT.value:
-            pong = create_heartbeat_msg(self.server.server_id, is_reply=True)
+        elif msg_type in (MessageType.PING.value, "PING", "HEARTBEAT"):
+            pong = create_pong_msg(self.server.server_id, self.room_code)
             pong.seq_num = room.current_seq_num
-            pong.room_code = self.room_code
             self.send_message(pong)
 
-        elif msg_type == MessageType.SYNC_REQUEST.value:
-            # Deliver complete state recovery for late joiner or reconnected client
-            sync_msg = create_sync_state_msg(room.state.to_dict_list())
-            sync_msg.payload["chat_history"] = room.get_chat_history()
-            sync_msg.seq_num = room.current_seq_num
-            sync_msg.room_code = self.room_code
+        elif msg_type in (MessageType.PONG.value, "PONG"):
+            pass
+
+        elif msg_type in (MessageType.STATE_REQUEST.value, "STATE_REQUEST", "SYNC_REQUEST"):
+            sync_msg = create_canvas_state_msg(
+                room_id=self.room_code,
+                actions=room.state.to_dict_list(),
+                chat_history=room.get_chat_history(),
+                seq_num=room.current_seq_num,
+            )
             self.send_message(sync_msg)
 
         elif msg_type == MessageType.LOAD_STATE.value:
             seq = room.next_seq_num()
             actions_list = payload.get("actions", [])
             room.state.load_from_dict_list(actions_list)
-            load_broadcast = create_load_state_msg(actions_list, loaded_by=self.username)
+            load_broadcast = create_load_state_msg(actions_list, loaded_by=self.username, room_id=self.room_code)
             load_broadcast.seq_num = seq
-            load_broadcast.room_code = self.room_code
             room.broadcast(load_broadcast)
 
         elif msg_type == MessageType.ROOM_LIST.value:
             rooms_info = self.server.room_manager.list_rooms()
             self.send_message(create_room_list_msg(rooms_info))
 
-        elif msg_type == MessageType.LEAVE.value:
+        elif msg_type in (MessageType.DISCONNECT.value, "DISCONNECT", "LEAVE"):
             self._running = False
 
     def send_message(self, message: ProtocolMessage) -> bool:
@@ -449,9 +482,7 @@ class WhiteboardServer:
                 f"User '{username or user_id}' left room '{room_code}'. "
                 f"Remaining in room: {len(room.get_active_users_list())}"
             )
-            left_msg = create_user_left_msg(user_id, username or "User")
-            left_msg.room_code = room_code
-            left_msg.seq_num = room.current_seq_num
+            left_msg = create_participant_left_msg(user_id, room_code, username or "User", seq_num=room.current_seq_num)
             room.broadcast(left_msg)
 
     def broadcast(

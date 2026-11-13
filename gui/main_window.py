@@ -363,52 +363,86 @@ class MainWindow(tk.Tk):
         msg_type = msg.msg_type
         payload = msg.payload
 
-        if msg_type == MessageType.DRAW_SEGMENT.value:
-            # Remote user drew a live stroke segment
-            self.canvas_view.draw_remote_segment(
-                stroke_id=payload.get("stroke_id", ""),
-                x1=payload.get("x1", 0.0),
-                y1=payload.get("y1", 0.0),
-                x2=payload.get("x2", 0.0),
-                y2=payload.get("y2", 0.0),
-                color=payload.get("color", "#000000"),
-                width=payload.get("width", 3),
-            )
-
-        elif msg_type in (MessageType.DRAW_STROKE.value, MessageType.SHAPE.value, MessageType.ERASE.value):
-            action_data = payload.get("action")
-            if action_data:
+        if msg_type in (MessageType.DRAW_EVENT.value, "DRAW_EVENT", "DRAW_SEGMENT", "DRAW_STROKE", "SHAPE"):
+            is_live = payload.get("is_live", False) or (msg_type == "DRAW_SEGMENT")
+            if is_live:
+                pts = payload.get("points")
+                if pts and len(pts) >= 2:
+                    x1, y1 = pts[0][0], pts[0][1]
+                    x2, y2 = pts[-1][0], pts[-1][1]
+                else:
+                    x1 = payload.get("x1", 0.0)
+                    y1 = payload.get("y1", 0.0)
+                    x2 = payload.get("x2", 0.0)
+                    y2 = payload.get("y2", 0.0)
+                self.canvas_view.draw_remote_segment(
+                    stroke_id=payload.get("stroke_id", ""),
+                    x1=x1,
+                    y1=y1,
+                    x2=x2,
+                    y2=y2,
+                    color=payload.get("color", "#000000"),
+                    width=payload.get("width", 3),
+                )
+            else:
+                action_data = payload.get("action")
+                if not action_data:
+                    action_data = {
+                        "action_id": payload.get("stroke_id"),
+                        "action_type": payload.get("shape_type", "pen"),
+                        "user_id": msg.sender_id,
+                        "color": payload.get("color", "#000000"),
+                        "width": payload.get("width", 3),
+                        "points": payload.get("points", []),
+                        "fill": payload.get("fill"),
+                    }
                 action = WhiteboardAction.from_dict(action_data)
                 self.local_state.add_action(action)
                 self.canvas_view.render_action(action)
                 self._update_action_counter()
 
-        elif msg_type == MessageType.CLEAR.value:
+        elif msg_type in (MessageType.ERASE_EVENT.value, "ERASE_EVENT", "ERASE"):
+            action_data = payload.get("action")
+            if not action_data:
+                action_data = {
+                    "action_id": payload.get("stroke_id"),
+                    "action_type": "eraser",
+                    "user_id": msg.sender_id,
+                    "color": "#FFFFFF",
+                    "width": payload.get("width", 10),
+                    "points": payload.get("points", []),
+                }
+            action = WhiteboardAction.from_dict(action_data)
+            self.local_state.add_action(action)
+            self.canvas_view.render_action(action)
+            self._update_action_counter()
+
+        elif msg_type in (MessageType.CLEAR_CANVAS.value, "CLEAR_CANVAS", "CLEAR"):
             user = payload.get("username", "Someone")
-            self.local_state.clear(payload.get("user_id", ""), user)
+            self.local_state.clear(payload.get("user_id", msg.sender_id), user)
             self.canvas_view.clear()
             self.chat_panel.append_system_notification(f"Whiteboard cleared by {user}")
             self._update_action_counter()
 
-        elif msg_type == MessageType.UNDO.value:
+        elif msg_type in (MessageType.UNDO_EVENT.value, "UNDO_EVENT", "UNDO"):
             action_id = payload.get("action_id")
-            user_id = payload.get("user_id")
+            user_id = payload.get("user_id", msg.sender_id)
             undone = self.local_state.undo_action(user_id=user_id, target_action_id=action_id)
             self.canvas_view.redraw_all(self.local_state.get_all_actions())
             self._update_action_counter()
             if undone:
-                self.chat_panel.append_system_notification(f"Undo action by {undone.username}")
+                self.chat_panel.append_system_notification(f"Undo action by {undone.username or 'user'}")
 
-        elif msg_type == MessageType.REDO.value:
+        elif msg_type in (MessageType.REDO_EVENT.value, "REDO_EVENT", "REDO"):
             action_id = payload.get("action_id")
-            user_id = payload.get("user_id")
+            user_id = payload.get("user_id", msg.sender_id)
             redone = self.local_state.redo_action(user_id=user_id, target_action_id=action_id)
             self.canvas_view.redraw_all(self.local_state.get_all_actions())
             self._update_action_counter()
             if redone:
-                self.chat_panel.append_system_notification(f"Redo action by {redone.username}")
+                self.chat_panel.append_system_notification(f"Redo action by {redone.username or 'user'}")
 
-        elif msg_type == MessageType.CHAT.value:
+        elif msg_type in (MessageType.CHAT_MESSAGE.value, "CHAT_MESSAGE", "CHAT"):
             self.chat_panel.append_chat_message(
                 username=payload.get("username", "User"),
                 text=payload.get("text", ""),
@@ -416,9 +450,9 @@ class MainWindow(tk.Tk):
                 color=payload.get("color", "#2C3E50"),
             )
 
-        elif msg_type == MessageType.USER_JOINED.value:
+        elif msg_type in (MessageType.PARTICIPANT_JOINED.value, "PARTICIPANT_JOINED", "USER_JOINED"):
             new_user = {
-                "user_id": payload.get("user_id"),
+                "user_id": payload.get("user_id", msg.sender_id),
                 "username": payload.get("username"),
                 "color": payload.get("color"),
             }
@@ -426,14 +460,14 @@ class MainWindow(tk.Tk):
             self.chat_panel.update_participants(self.active_users)
             self.chat_panel.append_system_notification(f"{new_user['username']} joined the whiteboard")
 
-        elif msg_type == MessageType.USER_LEFT.value:
-            left_id = payload.get("user_id")
+        elif msg_type in (MessageType.PARTICIPANT_LEFT.value, "PARTICIPANT_LEFT", "USER_LEFT"):
+            left_id = payload.get("user_id", msg.sender_id)
             left_name = payload.get("username", "Participant")
             self.active_users = [u for u in self.active_users if u.get("user_id") != left_id]
             self.chat_panel.update_participants(self.active_users)
             self.chat_panel.append_system_notification(f"{left_name} left the whiteboard")
 
-        elif msg_type == MessageType.SYNC_STATE.value:
+        elif msg_type in (MessageType.CANVAS_STATE.value, "CANVAS_STATE", "SYNC_STATE"):
             actions_raw = payload.get("actions", [])
             self.local_state.load_from_dict_list(actions_raw)
             self.canvas_view.redraw_all(self.local_state.get_all_actions())
